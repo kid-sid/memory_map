@@ -1,0 +1,8 @@
+venv/
+tests/
+__pycache__/
+.venv/
+.env
+.vscode/
+.claude/
+CLAUDE.md

@@ -1,0 +1,4 @@
+{
+  "stack": "Python MCP server using fastmcp + httpx",
+  "tools": "get_local_structure, get_github_structure, get_git_history, save/load/delete_memory"
+}
