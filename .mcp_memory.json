@@ -1,4 +1,10 @@
 {
-  "stack": "Python MCP server using fastmcp + httpx",
-  "tools": "get_local_structure, get_github_structure, get_git_history, save/load/delete_memory"
+  "stack": "Python MCP server using fastmcp + httpx, GPT-4o-mini for history summarization",
+  "tools": "get_local_structure, get_github_structure, get_git_history, save/load/delete_memory, set_compression, save/load_history",
+  "architecture": "Single-file server (server.py ~430 lines), history_hook.py for Claude Code hooks, .mcp_memory.json for key-value context, .mcp_history.json for conversation history",
+  "compression": "3-level read-time compression (0=raw, 1=compact, 2=dense) using abbreviation dict + filler removal. Tested 35/35 in tests/test_compression.py",
+  "history_system": "Hook fires on UserPromptSubmit (every 10 msgs) and PreCompact. Reads transcript, sends to GPT-4o-mini for summary, saves to .mcp_history.json as rolling 20-chunk window",
+  "hooks": "Configured in .claude/settings.local.json — UserPromptSubmit and PreCompact events trigger history_hook.py",
+  "current_work": "History hook system complete, needs OPENAI_API_KEY env var and Claude Code restart to activate hooks",
+  "key_files": "server.py (all MCP tools), history_hook.py (hook script), tests/test_compression.py (35 tests), tests/test_history.py (18 tests)"
 }

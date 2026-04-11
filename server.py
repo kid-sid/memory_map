@@ -5,6 +5,7 @@ import json
 import os
 import fnmatch
 import subprocess
+import re
 
 mcp = FastMCP("file-structure")
 
@@ -197,6 +198,51 @@ def get_git_history(path: str, count: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 MEMORY_FILE = ".mcp_memory.json"
+HISTORY_FILE = ".mcp_history.json"
+MAX_HISTORY_CHUNKS = 20
+COMPRESSION_KEY = "_compression"
+DEFAULT_COMPRESSION = 1
+
+# Conservative abbreviations that LLMs understand natively
+ABBREVIATIONS = {
+    "python": "py", "javascript": "js", "typescript": "ts",
+    "kubernetes": "k8s", "database": "db", "repository": "repo",
+    "application": "app", "server": "srv", "configuration": "config",
+    "environment": "env", "directory": "dir", "function": "fn",
+    "library": "lib", "authentication": "auth",
+    "development": "dev", "production": "prod",
+    "dependencies": "deps", "dependency": "dep",
+    "frontend": "fe", "backend": "be",
+    "commands": "cmds", "command": "cmd",
+    "project": "proj", "description": "desc",
+    "languages": "langs", "language": "lang",
+    "packages": "pkgs", "package": "pkg",
+    "documentation": "docs", "document": "doc",
+    "implementation": "impl",
+}
+
+# Filler words stripped at level 2 (path-safe: won't match near / or \)
+FILLER_PATTERNS = [
+    r"(?<![/\\])\bthe\s+",
+    r"(?<![/\\])\ba\s+(?![/\\])",
+    r"(?<![/\\])\ban\s+",
+    r"\bis\s+",
+    r"\bare\s+",
+]
+
+# Key name abbreviations for level 2
+KEY_ABBREVIATIONS = {
+    "architecture": "arch",
+    "entry_point": "entry",
+    "canonical_format": "canon",
+    "current_work": "wip",
+    "conventions": "conv",
+    "structure": "struct",
+    "environment_variables": "env",
+    "env_vars": "env",
+    "testing": "test",
+    "deployment": "deploy",
+}
 
 
 def _memory_path(project_path: str) -> pathlib.Path:
@@ -217,9 +263,62 @@ def _write_memory(project_path: str, data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _read_compression_level(project_path: str) -> int:
+    """Read compression level from memory metadata. Returns 0, 1, or 2."""
+    p = _memory_path(project_path)
+    if not p.exists():
+        return DEFAULT_COMPRESSION
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    level = data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
+    return max(0, min(2, int(level)))
+
+
+def _shorten_key(key: str) -> str:
+    """Shorten a memory key using known abbreviations."""
+    return KEY_ABBREVIATIONS.get(key, key)
+
+
+def _abbreviate(text: str) -> str:
+    """Apply abbreviation dictionary and strip filler words."""
+    result = text
+    for full, short in ABBREVIATIONS.items():
+        result = re.sub(r'\b' + re.escape(full) + r'\b', short, result, flags=re.IGNORECASE)
+    for pattern in FILLER_PATTERNS:
+        result = re.sub(pattern, '', result, flags=re.IGNORECASE)
+    result = re.sub(r'\s{2,}', ' ', result).strip()
+    return result
+
+
+def _compress_memory(data: dict, level: int = 1) -> str:
+    """Compress memory dict into LLM-optimized text.
+
+    Level 0 (raw):     key: value
+    Level 1 (compact): [key] value
+    Level 2 (dense):   [shortened_key] abbreviated_value
+    """
+    entries = {k: v for k, v in data.items() if not k.startswith("_")}
+
+    if not entries:
+        return "no memory saved yet"
+
+    if level == 0:
+        return "\n".join(f"{k}: {v}" for k, v in entries.items())
+
+    lines = []
+    for key, value in entries.items():
+        short_key = _shorten_key(key) if level >= 2 else key
+        compressed_value = _abbreviate(value) if level >= 2 else value
+        lines.append(f"[{short_key}] {compressed_value}")
+
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def save_memory(project_path: str, key: str, content: str) -> str:
     """Save or update a memory entry for a project. Use short keys (e.g. 'stack', 'architecture', 'gotchas')."""
+    if key.startswith("_"):
+        return "error: keys starting with '_' are reserved for system use"
     try:
         data = _read_memory(project_path)
         data[key] = content
@@ -236,7 +335,8 @@ def load_memory(project_path: str) -> str:
         data = _read_memory(project_path)
         if not data:
             return "no memory saved yet"
-        return "\n".join(f"{k}: {v}" for k, v in data.items())
+        level = _read_compression_level(project_path)
+        return _compress_memory(data, level)
     except Exception as e:
         return f"error: {e}"
 
@@ -251,6 +351,96 @@ def delete_memory(project_path: str, key: str) -> str:
         del data[key]
         _write_memory(project_path, data)
         return f"deleted: {key}"
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def set_compression(project_path: str, level: int) -> str:
+    """Set the compression level for memory output (0=raw, 1=compact, 2=dense)."""
+    if level not in (0, 1, 2):
+        return "error: level must be 0, 1, or 2"
+    try:
+        data = _read_memory(project_path)
+        data[COMPRESSION_KEY] = level
+        _write_memory(project_path, data)
+        return f"compression set to {level}"
+    except Exception as e:
+        return f"error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Tool: Conversation history
+# ---------------------------------------------------------------------------
+
+def _history_path(project_path: str) -> pathlib.Path:
+    return pathlib.Path(project_path) / HISTORY_FILE
+
+
+def _read_history(project_path: str) -> dict:
+    p = _history_path(project_path)
+    if not p.exists():
+        return {"_meta": {"max_chunks": MAX_HISTORY_CHUNKS, "watermark": 0}, "chunks": []}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"_meta": {"max_chunks": MAX_HISTORY_CHUNKS, "watermark": 0}, "chunks": []}
+
+
+def _write_history(project_path: str, data: dict) -> None:
+    p = _history_path(project_path)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+@mcp.tool()
+def save_history(project_path: str, summary: str, session_id: str = "") -> str:
+    """Save a conversation history chunk. Appends to a rolling buffer of recent conversation summaries."""
+    try:
+        data = _read_history(project_path)
+        chunks = data.get("chunks", [])
+
+        next_id = (chunks[-1]["id"] + 1) if chunks else 1
+        chunks.append({
+            "id": next_id,
+            "ts": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%S"),
+            "session": session_id[:8] if session_id else "",
+            "summary": summary,
+        })
+
+        if len(chunks) > MAX_HISTORY_CHUNKS:
+            chunks = chunks[-MAX_HISTORY_CHUNKS:]
+
+        data["chunks"] = chunks
+        _write_history(project_path, data)
+        return f"history saved: chunk {next_id}"
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def load_history(project_path: str, last_n: int = 5) -> str:
+    """Load recent conversation history. Call at session start for continuity."""
+    try:
+        data = _read_history(project_path)
+        chunks = data.get("chunks", [])
+        if not chunks:
+            return "no history yet"
+
+        recent = chunks[-last_n:]
+        level = _read_compression_level(project_path)
+
+        lines = ["=== Recent History ==="]
+        for chunk in recent:
+            summary = chunk.get("summary", "")
+            if level >= 2:
+                summary = _abbreviate(summary)
+            lines.append(f"[{chunk['id']}] {summary}")
+
+        return "\n".join(lines)
     except Exception as e:
         return f"error: {e}"
 

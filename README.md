@@ -1,24 +1,30 @@
-# Memory Map — File Structure MCP Server
+# Memory Map — MCP Server for Claude Code
 
-An MCP server for Claude that provides project structure, git history, and persistent memory — so Claude understands your codebase from the first message of every session.
+An MCP server that gives Claude persistent memory and conversation history — so it understands your project from the very first message of every session, without you re-explaining anything.
 
 ## What it does
 
 - **Project structure** — local directory tree or any GitHub repo, `.gitignore`-aware
 - **Git history** — recent commits in a compact format
-- **Session memory** — save context once, Claude loads it automatically every session
+- **Session memory** — save context once, Claude loads it automatically at session start
+- **Conversation history** — automatically summarizes past conversations so Claude stays in context across sessions
+- **Compression** — memory output is token-optimized at 3 levels (raw / compact / dense)
+- **Manual save** — `/mem_save` slash command to checkpoint the conversation any time
+
+---
 
 ## Prerequisites
 
 - Python 3.10+
 - Git installed and on your PATH
 - [Claude Code](https://claude.ai/code) CLI installed
+- (Optional) OpenAI API key — needed for AI-powered history summarization
 
 ---
 
 ## Setup
 
-### Step 1 — Clone and install dependencies
+### Step 1 — Clone and install
 
 ```bash
 git clone https://github.com/kid-sid/memory_map.git
@@ -39,14 +45,14 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Note the full path to your `server.py` — you'll need it in the next step.
+Note the full path to `server.py` — you'll need it in the next step.
 Example: `C:/Users/yourname/memory_map/server.py`
 
 ---
 
 ### Step 2 — Register the MCP server with Claude Code
 
-Run this command once (replace the path with your actual path):
+Run this once (replace the path with your actual path):
 
 ```bash
 claude mcp add file-structure python C:/Users/yourname/memory_map/server.py
@@ -69,13 +75,13 @@ Open Claude Code and run:
 /mcp
 ```
 
-You should see `file-structure` listed with 6 tools. If it's not there, double-check the path in Step 2.
+You should see `file-structure` listed with 9 tools. If it's not there, double-check the path in Step 2.
 
 ---
 
 ### Step 4 — Enable session memory for a project
 
-Copy `CLAUDE.md` from this repo into the root of any project you want Claude to remember:
+Copy `CLAUDE.md` into the root of any project you want Claude to remember:
 
 **Windows:**
 ```bash
@@ -87,7 +93,66 @@ copy C:\Users\yourname\memory_map\CLAUDE.md C:\Users\yourname\your-project\CLAUD
 cp ~/memory_map/CLAUDE.md ~/your-project/CLAUDE.md
 ```
 
-Claude Code reads `CLAUDE.md` automatically at session start and will call `load_memory` before doing anything else.
+Claude Code reads `CLAUDE.md` automatically at session start — this tells it to call `load_memory` and `load_history` before doing anything else.
+
+---
+
+### Step 5 — Enable automatic conversation history (optional)
+
+This feature auto-summarizes your conversations every 5 messages and stores them in `.mcp_history.json`. It uses GPT-4o-mini, so you'll need an OpenAI API key.
+
+**Set your API key:**
+
+Windows:
+```bash
+$env:OPENAI_API_KEY = "sk-..."
+```
+
+Mac/Linux:
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+To make it permanent, add the export to your shell profile (`.bashrc`, `.zshrc`, or Windows environment variables).
+
+**Configure the hooks in your project's `.claude/settings.local.json`:**
+
+Create or edit `.claude/settings.local.json` in your project root with the following (replace the path to match where you cloned this repo):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:/Users/yourname/memory_map/history_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:/Users/yourname/memory_map/history_hook.py --force",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Restart Claude Code. History will now be saved automatically every 5 messages and whenever context compaction happens.
+
+> **Without an OpenAI key:** The hook still works — it saves a raw truncated excerpt instead of an AI summary.
 
 ---
 
@@ -96,18 +161,49 @@ Claude Code reads `CLAUDE.md` automatically at session start and will call `load
 **First session** — Claude explores your project and saves what matters:
 ```
 save_memory(path, "stack", "Next.js frontend, FastAPI backend, Postgres")
-save_memory(path, "entry_point", "main.py bootstraps the app, loads config from .env")
 save_memory(path, "gotchas", "never import db.py directly, always go through models/")
 ```
 
 **Every session after** — Claude calls `load_memory` first and has full context instantly:
 ```
-stack: Next.js frontend, FastAPI backend, Postgres
-entry_point: main.py bootstraps the app, loads config from .env
-gotchas: never import db.py directly, always go through models/
+[stack] Next.js frontend, FastAPI backend, Postgres
+[gotchas] never import db.py directly, always go through models/
 ```
 
 No file reading. No re-explaining the codebase. Context in one tool call.
+
+---
+
+## How conversation history works
+
+Every 5 user messages, the hook reads your conversation transcript, sends it to GPT-4o-mini, and saves a dense summary to `.mcp_history.json`. At session start, Claude calls `load_history` and gets the last 5 summaries — so it knows what you were working on even after days away.
+
+A rolling window of 20 chunks is kept. Older ones are dropped automatically.
+
+---
+
+## Memory compression
+
+Memory output is compressed at read time to save tokens. Three levels are available:
+
+| Level | Format | Example |
+|---|---|---|
+| `0` (raw) | `key: value` | `stack: Python server using fastmcp` |
+| `1` (compact, default) | `[key] value` | `[stack] Python server using fastmcp` |
+| `2` (dense) | abbreviated keys + values | `[stack] py srv using fastmcp` |
+
+Set the level per project:
+```
+set_compression(project_path, 1)
+```
+
+---
+
+## Manual history save — `/mem_save`
+
+Type `/mem_save` in Claude Code at any time to immediately checkpoint the recent conversation. Claude will summarize what was discussed and call `save_history` for you.
+
+This is useful when conversations get long, before switching topics, or before closing a session mid-task.
 
 ---
 
@@ -118,9 +214,12 @@ No file reading. No re-explaining the codebase. Context in one tool call.
 | `get_local_structure` | `path`, `max_depth=5` | Directory tree of a local folder |
 | `get_github_structure` | `repo`, `branch="main"` | File tree of a GitHub repo (`owner/repo`) |
 | `get_git_history` | `path`, `count=5` | Recent commits as `hash \| subject` |
-| `save_memory` | `project_path`, `key`, `content` | Save a context entry |
-| `load_memory` | `project_path` | Load all saved context |
+| `save_memory` | `project_path`, `key`, `content` | Save or update a context entry |
+| `load_memory` | `project_path` | Load all saved context (compressed) |
 | `delete_memory` | `project_path`, `key` | Remove a specific entry |
+| `set_compression` | `project_path`, `level` | Set compression level (0, 1, or 2) |
+| `save_history` | `project_path`, `summary`, `session_id` | Save a conversation history chunk |
+| `load_history` | `project_path`, `last_n=5` | Load recent conversation summaries |
 
 ---
 
@@ -137,8 +236,6 @@ $env:GITHUB_TOKEN = "your_token_here"
 ```bash
 export GITHUB_TOKEN="your_token_here"
 ```
-
-To make it permanent, add the export to your shell profile (`.bashrc`, `.zshrc`, etc.).
 
 ---
 
