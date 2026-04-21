@@ -52,16 +52,17 @@ Example: `C:/Users/yourname/memory_map/server.py`
 
 ### Step 2 — Register the MCP server with Claude Code
 
-Run this once (replace the path with your actual path):
+Run this once (replace the path with your actual path). The `-s user` flag makes it available in **all projects**, not just the current one.
 
+**Windows with venv:**
 ```bash
-claude mcp add file-structure python C:/Users/yourname/memory_map/server.py
+claude mcp add -s user memory_map C:/Users/yourname/memory_map/venv/Scripts/python.exe C:/Users/yourname/memory_map/server.py
 ```
 
-> **Windows with venv:** Use the venv's Python to avoid dependency issues:
-> ```bash
-> claude mcp add file-structure C:/Users/yourname/memory_map/venv/Scripts/python.exe C:/Users/yourname/memory_map/server.py
-> ```
+**Mac/Linux:**
+```bash
+claude mcp add -s user memory_map python3 /home/yourname/memory_map/server.py
+```
 
 Restart Claude Code after running this.
 
@@ -99,7 +100,7 @@ Claude Code reads `CLAUDE.md` automatically at session start — this tells it t
 
 ### Step 5 — Enable automatic conversation history (optional)
 
-This feature auto-summarizes your conversations every 5 messages and stores them in `.mcp_history.json`. It uses GPT-4o-mini, so you'll need an OpenAI API key.
+This feature auto-summarizes your conversations every 10 messages and stores them in `.mcp_history.json`. It uses GPT-4o-mini, so you'll need an OpenAI API key.
 
 **Set your API key:**
 
@@ -115,10 +116,11 @@ export OPENAI_API_KEY="sk-..."
 
 To make it permanent, add the export to your shell profile (`.bashrc`, `.zshrc`, or Windows environment variables).
 
-**Configure the hooks in your project's `.claude/settings.local.json`:**
+**Configure the hooks globally in `~/.claude/settings.json`:**
 
-Create or edit `.claude/settings.local.json` in your project root with the following (replace the path to match where you cloned this repo):
+Adding hooks here means history is saved automatically in **every project** — no per-project setup needed. Replace the path to match where you cloned this repo.
 
+**Windows (`C:\Users\yourname\.claude\settings.json`):**
 ```json
 {
   "hooks": {
@@ -145,12 +147,70 @@ Create or edit `.claude/settings.local.json` in your project root with the follo
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:/Users/yourname/memory_map/history_hook.py --force",
+            "timeout": 15,
+            "async": true
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-Restart Claude Code. History will now be saved automatically every 5 messages and whenever context compaction happens.
+**Mac/Linux (`~/.claude/settings.json`):**
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/yourname/memory_map/history_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/yourname/memory_map/history_hook.py --force",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/yourname/memory_map/history_hook.py --force",
+            "timeout": 15,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Restart Claude Code. History will now be saved automatically every 10 messages, on context compaction, and when the session ends.
 
 > **Without an OpenAI key:** The hook still works — it saves a raw truncated excerpt instead of an AI summary.
 
