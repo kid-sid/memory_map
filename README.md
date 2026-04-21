@@ -76,7 +76,7 @@ Open Claude Code and run:
 /mcp
 ```
 
-You should see `file-structure` listed with 9 tools. If it's not there, double-check the path in Step 2.
+You should see `memory_map` listed with 9 tools. If it's not there, double-check the path in Step 2.
 
 ---
 
@@ -236,7 +236,7 @@ No file reading. No re-explaining the codebase. Context in one tool call.
 
 ## How conversation history works
 
-Every 5 user messages, the hook reads your conversation transcript, sends it to GPT-4o-mini, and saves a dense summary to `.mcp_history.json`. At session start, Claude calls `load_history` and gets the last 5 summaries — so it knows what you were working on even after days away.
+Every 10 user messages, the hook reads your conversation transcript, sends it to GPT-4o-mini, and saves a dense summary to `.mcp_history.json`. At session start, Claude calls `load_history` and gets the last 5 summaries — so it knows what you were working on even after days away.
 
 A rolling window of 20 chunks is kept. Older ones are dropped automatically.
 
