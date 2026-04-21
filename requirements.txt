@@ -1,2 +1,5 @@
 fastmcp
 httpx
+portalocker
+python-dotenv
+pytest

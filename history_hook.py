@@ -16,13 +16,33 @@ import json
 import os
 import pathlib
 import tempfile
+import time
 from datetime import datetime, timezone
 
 import httpx
+import portalocker
+from dotenv import load_dotenv
+
+load_dotenv(pathlib.Path(__file__).parent / ".env")
 
 HISTORY_FILE = ".mcp_history.json"
 MAX_CHUNKS = 20
 SAVE_INTERVAL = 10
+TEMP_FILE_TTL_DAYS = 7
+
+
+# --- Temp file cleanup ---
+
+def _cleanup_stale_temp_files():
+    """Delete session counter/watermark files older than TEMP_FILE_TTL_DAYS."""
+    tmp_dir = pathlib.Path(tempfile.gettempdir())
+    cutoff = datetime.now().timestamp() - TEMP_FILE_TTL_DAYS * 86400
+    for f in tmp_dir.glob("claude_hist_*.txt"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
 
 
 # --- Counter ---
@@ -67,8 +87,7 @@ def write_watermark(session_id: str, line_num: int):
 def extract_recent_dialogue(transcript_path: str, watermark: int) -> tuple[list[dict], int]:
     """Read transcript from watermark line onwards, extract user/assistant text.
 
-    Returns (exchanges, new_watermark) where exchanges is a list of
-    {"role": "user"|"assistant", "content": str} dicts.
+    Returns (exchanges, new_watermark).
     """
     exchanges = []
     total_lines = 0
@@ -93,15 +112,12 @@ def extract_recent_dialogue(transcript_path: str, watermark: int) -> tuple[list[
                 if entry_type not in ("user", "assistant") or role not in ("user", "assistant"):
                     continue
 
-                # Extract text content
                 text = ""
                 if isinstance(content, str):
-                    # Skip meta/command messages
                     if content.startswith("<local-command") or content.startswith("<command-name>"):
                         continue
                     text = content.strip()
                 elif isinstance(content, list):
-                    # Extract text blocks only (skip thinking, tool_use, tool_result)
                     parts = []
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
@@ -116,47 +132,63 @@ def extract_recent_dialogue(transcript_path: str, watermark: int) -> tuple[list[
     return exchanges, total_lines
 
 
-# --- GPT summarization ---
+# --- GPT summarization with retry ---
 
 def summarize_with_gpt(dialogue: str) -> str:
-    """Call OpenAI GPT-4o-mini to summarize conversation dialogue."""
+    """Call OpenAI GPT-4o-mini to summarize conversation dialogue.
+
+    Retries up to 3 times with exponential backoff on transient errors.
+    Falls back to truncated raw text if all attempts fail.
+    """
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        # Fallback: truncated raw text
         return dialogue[:300]
 
-    try:
-        resp = httpx.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize this conversation into a dense, compressed format. "
-                            "Focus on: decisions made, code changes, topics discussed, "
-                            "problems solved. Use abbreviations (py, js, db, srv, auth, "
-                            "fe, be, config, env, etc). Max 200 chars. No filler words. "
-                            "Output only the summary, nothing else."
-                        ),
-                    },
-                    {"role": "user", "content": dialogue},
-                ],
-                "max_tokens": 150,
-                "temperature": 0,
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        # On any API error, fall back to truncated text
-        return dialogue[:300]
+    retryable_statuses = {429, 500, 503}
+    delays = [1, 2, 4]
+
+    for attempt, delay in enumerate(delays):
+        try:
+            resp = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Summarize this conversation into a dense, compressed format. "
+                                "Focus on: decisions made, code changes, topics discussed, "
+                                "problems solved. Use abbreviations (py, js, db, srv, auth, "
+                                "fe, be, config, env, etc). Max 200 chars. No filler words. "
+                                "Output only the summary, nothing else."
+                            ),
+                        },
+                        {"role": "user", "content": dialogue},
+                    ],
+                    "max_tokens": 150,
+                    "temperature": 0,
+                },
+                timeout=10,
+            )
+            if resp.status_code in retryable_statuses:
+                if attempt < len(delays) - 1:
+                    time.sleep(delay)
+                    continue
+                break
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except (httpx.TimeoutException, httpx.NetworkError):
+            if attempt < len(delays) - 1:
+                time.sleep(delay)
+        except Exception:
+            break
+
+    return dialogue[:300]
 
 
 # --- History storage ---
@@ -188,7 +220,6 @@ def save_chunk(cwd: str, session_id: str, summary: str, watermark: int):
         "summary": summary,
     })
 
-    # Enforce rolling window
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[-MAX_CHUNKS:]
 
@@ -199,15 +230,18 @@ def save_chunk(cwd: str, session_id: str, summary: str, watermark: int):
 
     p = _history_path(cwd)
     with open(p, "w", encoding="utf-8") as f:
+        portalocker.lock(f, portalocker.LOCK_EX)
         json.dump(data, f, indent=2)
+        portalocker.unlock(f)
 
 
 # --- Main ---
 
 def main():
+    _cleanup_stale_temp_files()
+
     force = "--force" in sys.argv
 
-    # Read stdin JSON from Claude Code
     try:
         stdin_data = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, EOFError):
@@ -222,46 +256,35 @@ def main():
         print("{}")
         return
 
-    # Increment counter
     count = increment_counter(session_id)
 
-    # Check if we should save
     if not force and (count % SAVE_INTERVAL != 0):
         print("{}")
         return
 
-    # No transcript path → can't extract
     if not transcript_path or not os.path.exists(transcript_path):
         print("{}")
         return
 
-    # Read watermark
     watermark = read_watermark(session_id)
 
-    # Extract recent dialogue
     exchanges, new_watermark = extract_recent_dialogue(transcript_path, watermark)
 
     if not exchanges:
         print("{}")
         return
 
-    # Build dialogue text for summarization
     dialogue = "\n".join(f"{e['role']}: {e['content']}" for e in exchanges)
 
-    # Truncate dialogue input to ~4000 chars to keep API call small
     if len(dialogue) > 4000:
         dialogue = dialogue[:4000]
 
-    # Summarize
     summary = summarize_with_gpt(dialogue)
 
-    # Save chunk
     save_chunk(cwd, session_id, summary, new_watermark)
 
-    # Update watermark
     write_watermark(session_id, new_watermark)
 
-    # Output systemMessage
     chunk_count = len(read_history(cwd).get("chunks", []))
     output = {
         "systemMessage": f"[history] Conversation checkpoint saved (chunk {chunk_count}/{MAX_CHUNKS})"

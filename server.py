@@ -6,14 +6,99 @@ import os
 import fnmatch
 import subprocess
 import re
+import datetime
+
+import portalocker
 
 mcp = FastMCP("file-structure")
 
 DEFAULT_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "dist", ".next", ".mypy_cache", ".pytest_cache"}
 
+MEMORY_FILE = ".mcp_memory.json"
+HISTORY_FILE = ".mcp_history.json"
+MAX_HISTORY_CHUNKS = 20
+COMPRESSION_KEY = "_compression"
+DEFAULT_COMPRESSION = 1
+KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,100}$')
+MAX_ENTRY_KB = int(os.environ.get("MCP_MAX_ENTRY_KB", "10"))
+GIT_TIMEOUT = int(os.environ.get("MCP_GIT_TIMEOUT", "10"))
+GLOBAL_MEMORY_FILE = pathlib.Path.home() / ".mcp_global_memory.json"
+
+ABBREVIATIONS = {
+    "python": "py", "javascript": "js", "typescript": "ts",
+    "kubernetes": "k8s", "database": "db", "repository": "repo",
+    "application": "app", "server": "srv", "configuration": "config",
+    "environment": "env", "directory": "dir", "function": "fn",
+    "library": "lib", "authentication": "auth",
+    "development": "dev", "production": "prod",
+    "dependencies": "deps", "dependency": "dep",
+    "frontend": "fe", "backend": "be",
+    "commands": "cmds", "command": "cmd",
+    "project": "proj", "description": "desc",
+    "languages": "langs", "language": "lang",
+    "packages": "pkgs", "package": "pkg",
+    "documentation": "docs", "document": "doc",
+    "implementation": "impl",
+}
+
+FILLER_PATTERNS = [
+    r"(?<![/\\])\bthe\s+",
+    r"(?<![/\\])\ba\s+(?![/\\])",
+    r"(?<![/\\])\ban\s+",
+    r"\bis\s+",
+    r"\bare\s+",
+]
+
+KEY_ABBREVIATIONS = {
+    "architecture": "arch",
+    "entry_point": "entry",
+    "canonical_format": "canon",
+    "current_work": "wip",
+    "conventions": "conv",
+    "structure": "struct",
+    "environment_variables": "env",
+    "env_vars": "env",
+    "testing": "test",
+    "deployment": "deploy",
+}
+
+
+# ---------------------------------------------------------------------------
+# Shared JSON helpers
+# ---------------------------------------------------------------------------
+
+def _load_json_safe(path: pathlib.Path, default: dict) -> dict:
+    """Load JSON from path; on corruption, back up the file and return default."""
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.parent / f"{path.name}.bak.{ts}"
+        try:
+            path.rename(backup)
+        except OSError:
+            pass
+        return default
+    except OSError:
+        return default
+
+
+def _locked_write(path: pathlib.Path, data: dict) -> None:
+    """Write JSON to path with an exclusive file lock."""
+    with open(path, "w", encoding="utf-8") as f:
+        portalocker.lock(f, portalocker.LOCK_EX)
+        json.dump(data, f, indent=2)
+        portalocker.unlock(f)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_local_structure
+# ---------------------------------------------------------------------------
 
 def load_gitignore_patterns(root_path: pathlib.Path) -> list[str]:
-    """Load patterns from a .gitignore file in the root path."""
     gitignore_path = root_path / ".gitignore"
     patterns = []
     if gitignore_path.exists():
@@ -21,7 +106,6 @@ def load_gitignore_patterns(root_path: pathlib.Path) -> list[str]:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    # Basic .gitignore to fnmatch conversion
                     if line.endswith("/"):
                         patterns.append(line[:-1])
                         patterns.append(line + "*")
@@ -31,7 +115,6 @@ def load_gitignore_patterns(root_path: pathlib.Path) -> list[str]:
 
 
 def is_ignored(entry_name: str, patterns: list[str]) -> bool:
-    """Check if an entry should be ignored based on patterns."""
     if entry_name in DEFAULT_IGNORE:
         return True
     for pattern in patterns:
@@ -40,12 +123,7 @@ def is_ignored(entry_name: str, patterns: list[str]) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_local_structure
-# ---------------------------------------------------------------------------
-
 def build_local_tree(dir_path: pathlib.Path, max_depth: int, patterns: list[str], current_depth: int = 0) -> "dict | list":
-    """Recursively build a JSON-friendly tree for a local directory."""
     try:
         entries = sorted(dir_path.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
         entries = [e for e in entries if not is_ignored(e.name, patterns)]
@@ -92,7 +170,6 @@ def get_local_structure(path: str, max_depth: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 def build_github_tree(items: list, max_depth: int) -> dict:
-    """Build a nested JSON tree from items returned by GitHub's recursive tree API."""
     root: dict = {}
     dirs = sorted([i for i in items if i["type"] == "tree"], key=lambda x: x["path"])
     files = sorted([i for i in items if i["type"] == "blob"], key=lambda x: x["path"])
@@ -156,24 +233,25 @@ def get_github_structure(repo: str, branch: str = "main") -> str:
 
 @mcp.tool()
 def get_git_history(path: str, count: int = 5) -> str:
-    """Get the recent git commit history for a local repository as minified JSON."""
+    """Get the recent git commit history for a local repository.
+
+    Timeout is controlled by MCP_GIT_TIMEOUT env var (default 10s).
+    """
     root = pathlib.Path(path)
     if not root.exists() or not root.is_dir():
         return json.dumps({"error": f"Invalid path: {path}"})
 
-    SEP = "\x1f"  # ASCII unit separator — never appears in commit messages
+    SEP = "\x1f"
 
     try:
-        # Check if it's a git repo
         subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=path, check=True, capture_output=True, text=True, timeout=5
+            cwd=path, check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT
         )
 
-        # Get logs in format: hash<SEP>subject
         result = subprocess.run(
             ["git", "log", f"-n{count}", f"--pretty=format:%H{SEP}%s"],
-            cwd=path, check=True, capture_output=True, text=True, timeout=10
+            cwd=path, check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT * 2
         )
 
         lines = []
@@ -194,93 +272,45 @@ def get_git_history(path: str, count: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: Memory management
+# Memory helpers
 # ---------------------------------------------------------------------------
-
-MEMORY_FILE = ".mcp_memory.json"
-HISTORY_FILE = ".mcp_history.json"
-MAX_HISTORY_CHUNKS = 20
-COMPRESSION_KEY = "_compression"
-DEFAULT_COMPRESSION = 1
-
-# Conservative abbreviations that LLMs understand natively
-ABBREVIATIONS = {
-    "python": "py", "javascript": "js", "typescript": "ts",
-    "kubernetes": "k8s", "database": "db", "repository": "repo",
-    "application": "app", "server": "srv", "configuration": "config",
-    "environment": "env", "directory": "dir", "function": "fn",
-    "library": "lib", "authentication": "auth",
-    "development": "dev", "production": "prod",
-    "dependencies": "deps", "dependency": "dep",
-    "frontend": "fe", "backend": "be",
-    "commands": "cmds", "command": "cmd",
-    "project": "proj", "description": "desc",
-    "languages": "langs", "language": "lang",
-    "packages": "pkgs", "package": "pkg",
-    "documentation": "docs", "document": "doc",
-    "implementation": "impl",
-}
-
-# Filler words stripped at level 2 (path-safe: won't match near / or \)
-FILLER_PATTERNS = [
-    r"(?<![/\\])\bthe\s+",
-    r"(?<![/\\])\ba\s+(?![/\\])",
-    r"(?<![/\\])\ban\s+",
-    r"\bis\s+",
-    r"\bare\s+",
-]
-
-# Key name abbreviations for level 2
-KEY_ABBREVIATIONS = {
-    "architecture": "arch",
-    "entry_point": "entry",
-    "canonical_format": "canon",
-    "current_work": "wip",
-    "conventions": "conv",
-    "structure": "struct",
-    "environment_variables": "env",
-    "env_vars": "env",
-    "testing": "test",
-    "deployment": "deploy",
-}
-
 
 def _memory_path(project_path: str) -> pathlib.Path:
     return pathlib.Path(project_path) / MEMORY_FILE
 
 
+def _history_path(project_path: str) -> pathlib.Path:
+    return pathlib.Path(project_path) / HISTORY_FILE
+
+
 def _read_memory(project_path: str) -> dict:
-    p = _memory_path(project_path)
-    if not p.exists():
-        return {}
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json_safe(_memory_path(project_path), {})
+
+
+def _read_history(project_path: str) -> dict:
+    default = {"_meta": {"max_chunks": MAX_HISTORY_CHUNKS, "watermark": 0}, "chunks": []}
+    return _load_json_safe(_history_path(project_path), default)
 
 
 def _write_memory(project_path: str, data: dict) -> None:
-    p = _memory_path(project_path)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _locked_write(_memory_path(project_path), data)
+
+
+def _write_history(project_path: str, data: dict) -> None:
+    _locked_write(_history_path(project_path), data)
 
 
 def _read_compression_level(project_path: str) -> int:
-    """Read compression level from memory metadata. Returns 0, 1, or 2."""
-    p = _memory_path(project_path)
-    if not p.exists():
-        return DEFAULT_COMPRESSION
-    with open(p, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = _load_json_safe(_memory_path(project_path), {})
     level = data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
     return max(0, min(2, int(level)))
 
 
 def _shorten_key(key: str) -> str:
-    """Shorten a memory key using known abbreviations."""
     return KEY_ABBREVIATIONS.get(key, key)
 
 
 def _abbreviate(text: str) -> str:
-    """Apply abbreviation dictionary and strip filler words."""
     result = text
     for full, short in ABBREVIATIONS.items():
         result = re.sub(r'\b' + re.escape(full) + r'\b', short, result, flags=re.IGNORECASE)
@@ -314,11 +344,19 @@ def _compress_memory(data: dict, level: int = 1) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Tools: Memory management
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def save_memory(project_path: str, key: str, content: str) -> str:
-    """Save or update a memory entry for a project. Use short keys (e.g. 'stack', 'architecture', 'gotchas')."""
+    """Save or update a memory entry for a project. Use short keys (e.g. 'stack', 'architecture')."""
     if key.startswith("_"):
         return "error: keys starting with '_' are reserved for system use"
+    if not KEY_PATTERN.match(key):
+        return "error: key must be 1-100 chars using only letters, digits, _ or -"
+    if len(content.encode("utf-8")) > MAX_ENTRY_KB * 1024:
+        return f"error: content exceeds {MAX_ENTRY_KB}KB limit (set MCP_MAX_ENTRY_KB to override)"
     try:
         data = _read_memory(project_path)
         data[key] = content
@@ -333,9 +371,9 @@ def load_memory(project_path: str) -> str:
     """Load all saved memory for a project. Call this at the start of every session."""
     try:
         data = _read_memory(project_path)
-        if not data:
+        if not any(not k.startswith("_") for k in data):
             return "no memory saved yet"
-        level = _read_compression_level(project_path)
+        level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
         return _compress_memory(data, level)
     except Exception as e:
         return f"error: {e}"
@@ -370,33 +408,12 @@ def set_compression(project_path: str, level: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: Conversation history
+# Tools: Conversation history
 # ---------------------------------------------------------------------------
-
-def _history_path(project_path: str) -> pathlib.Path:
-    return pathlib.Path(project_path) / HISTORY_FILE
-
-
-def _read_history(project_path: str) -> dict:
-    p = _history_path(project_path)
-    if not p.exists():
-        return {"_meta": {"max_chunks": MAX_HISTORY_CHUNKS, "watermark": 0}, "chunks": []}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {"_meta": {"max_chunks": MAX_HISTORY_CHUNKS, "watermark": 0}, "chunks": []}
-
-
-def _write_history(project_path: str, data: dict) -> None:
-    p = _history_path(project_path)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
 
 @mcp.tool()
 def save_history(project_path: str, summary: str, session_id: str = "") -> str:
-    """Save a conversation history chunk. Appends to a rolling buffer of recent conversation summaries."""
+    """Save a conversation history chunk. Appends to a rolling buffer of recent summaries."""
     try:
         data = _read_history(project_path)
         chunks = data.get("chunks", [])
@@ -404,9 +421,7 @@ def save_history(project_path: str, summary: str, session_id: str = "") -> str:
         next_id = (chunks[-1]["id"] + 1) if chunks else 1
         chunks.append({
             "id": next_id,
-            "ts": __import__("datetime").datetime.now(
-                __import__("datetime").timezone.utc
-            ).strftime("%Y-%m-%dT%H:%M:%S"),
+            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             "session": session_id[:8] if session_id else "",
             "summary": summary,
         })
@@ -441,6 +456,186 @@ def load_history(project_path: str, last_n: int = 5) -> str:
             lines.append(f"[{chunk['id']}] {summary}")
 
         return "\n".join(lines)
+    except Exception as e:
+        return f"error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Tools: Multi-project integration
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_projects(base_path: str) -> str:
+    """List all projects under base_path that have saved memory, with key counts and last save time."""
+    root = pathlib.Path(base_path)
+    if not root.exists() or not root.is_dir():
+        return json.dumps({"error": f"'{base_path}' is not a valid directory"})
+
+    projects = []
+    try:
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            mem_file = entry / MEMORY_FILE
+            if not mem_file.exists():
+                continue
+            data = _load_json_safe(mem_file, {})
+            keys = [k for k in data if not k.startswith("_")]
+            hist_file = entry / HISTORY_FILE
+            last_save = ""
+            if hist_file.exists():
+                hist = _load_json_safe(hist_file, {})
+                last_save = hist.get("_meta", {}).get("last_save", "")
+            projects.append({
+                "path": str(entry),
+                "name": entry.name,
+                "key_count": len(keys),
+                "last_save": last_save,
+            })
+    except PermissionError as e:
+        return json.dumps({"error": str(e)})
+
+    return json.dumps(projects)
+
+
+@mcp.tool()
+def get_project_summary(project_path: str) -> str:
+    """Return a summary of a project's stored memory and recent conversation history."""
+    try:
+        p = pathlib.Path(project_path)
+        name = p.name
+
+        mem_data = _read_memory(project_path)
+        keys = [k for k in mem_data if not k.startswith("_")]
+        compression = mem_data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
+
+        hist_data = _read_history(project_path)
+        last_save = hist_data.get("_meta", {}).get("last_save", "N/A")
+        chunks = hist_data.get("chunks", [])
+        recent = chunks[-3:] if chunks else []
+
+        lines = [
+            f"Project: {name}",
+            f"Keys stored: {len(keys)}",
+            f"Last history save: {last_save}",
+            f"Compression: level {compression}",
+        ]
+        if recent:
+            lines.append("Recent history (last 3):")
+            for chunk in recent:
+                lines.append(f"  [{chunk['id']}] {chunk.get('summary', '')}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def load_cross_project_memory(base_path: str, query_keys: str = "") -> str:
+    """Load memory from all projects under base_path, optionally filtered by comma-separated keys."""
+    root = pathlib.Path(base_path)
+    if not root.exists() or not root.is_dir():
+        return f"error: '{base_path}' is not a valid directory"
+
+    filter_keys = {k.strip() for k in query_keys.split(",") if k.strip()} if query_keys else set()
+
+    sections = []
+    try:
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            mem_file = entry / MEMORY_FILE
+            if not mem_file.exists():
+                continue
+            data = _load_json_safe(mem_file, {})
+            level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
+            entries = {k: v for k, v in data.items() if not k.startswith("_")}
+            if filter_keys:
+                entries = {k: v for k, v in entries.items() if k in filter_keys}
+            if not entries:
+                continue
+            compressed = _compress_memory(entries, level)
+            sections.append(f"=== {entry.name} ===\n{compressed}")
+    except PermissionError as e:
+        return f"error: {e}"
+
+    return "\n\n".join(sections) if sections else "no projects with memory found"
+
+
+@mcp.tool()
+def search_across_projects(base_path: str, keyword: str) -> str:
+    """Search memory values across all projects under base_path for a keyword (case-insensitive)."""
+    root = pathlib.Path(base_path)
+    if not root.exists() or not root.is_dir():
+        return f"error: '{base_path}' is not a valid directory"
+    if not keyword.strip():
+        return "error: keyword cannot be empty"
+
+    kw = keyword.lower()
+    matches = []
+
+    try:
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            mem_file = entry / MEMORY_FILE
+            if not mem_file.exists():
+                continue
+            data = _load_json_safe(mem_file, {})
+            for k, v in data.items():
+                if k.startswith("_"):
+                    continue
+                text = str(v)
+                if kw in text.lower():
+                    pos = text.lower().find(kw)
+                    start = max(0, pos - 30)
+                    end = min(len(text), pos + 70)
+                    prefix = "..." if start > 0 else ""
+                    suffix = "..." if end < len(text) else ""
+                    window = prefix + text[start:end] + suffix
+                    matches.append(f"{entry.name} / {k}: \"{window}\"")
+    except PermissionError as e:
+        return f"error: {e}"
+
+    return "\n".join(matches) if matches else f"no matches for '{keyword}'"
+
+
+def _read_global_memory() -> dict:
+    return _load_json_safe(GLOBAL_MEMORY_FILE, {})
+
+
+def _write_global_memory(data: dict) -> None:
+    _locked_write(GLOBAL_MEMORY_FILE, data)
+
+
+@mcp.tool()
+def save_global_memory(key: str, content: str) -> str:
+    """Save a user-level memory entry available across all projects (e.g. name, preferred stack)."""
+    if key.startswith("_"):
+        return "error: keys starting with '_' are reserved for system use"
+    if not KEY_PATTERN.match(key):
+        return "error: key must be 1-100 chars using only letters, digits, _ or -"
+    if len(content.encode("utf-8")) > MAX_ENTRY_KB * 1024:
+        return f"error: content exceeds {MAX_ENTRY_KB}KB limit"
+    try:
+        data = _read_global_memory()
+        data[key] = content
+        _write_global_memory(data)
+        return f"global saved: {key}"
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def load_global_memory() -> str:
+    """Load user-level memory available across all projects."""
+    try:
+        data = _read_global_memory()
+        entries = {k: v for k, v in data.items() if not k.startswith("_")}
+        if not entries:
+            return "=== GLOBAL ===\nno global memory saved yet"
+        compressed = _compress_memory(data, DEFAULT_COMPRESSION)
+        return f"=== GLOBAL ===\n{compressed}"
     except Exception as e:
         return f"error: {e}"
 
