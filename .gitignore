@@ -1,5 +1,7 @@
 venv/
 __pycache__/
+.mcp_memory.json
+.mcp_history.json
 .venv/
 .env
 .vscode/
