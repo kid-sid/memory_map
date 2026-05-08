@@ -4,3 +4,4 @@ portalocker
 pymongo
 python-dotenv
 pytest
+openai

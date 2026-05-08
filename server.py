@@ -520,32 +520,35 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
     calling load_history + get_history_chunks.
     """
     try:
-        # Pool 1 — tag-matched candidates across all history (age-independent)
-        msg_tags = history_store.extract_tags(user_message)
-        tag_candidates = history_store.query_by_tags(project_path, msg_tags, limit=30)
-
-        # Pool 2 — recency fallback (ensures recent work appears even with no tag match)
-        recent_candidates = history_store.load_index(project_path, last_n=10)
-
-        # Merge + deduplicate by id (tag candidates first)
-        seen: set = set()
-        candidates = []
-        for entry in tag_candidates + recent_candidates:
-            if entry["id"] not in seen:
-                seen.add(entry["id"])
-                candidates.append(entry)
-
-        if not candidates:
-            return "no history yet"
-
         # Anchor: always include the most recent chunk for session continuity
+        recent_candidates = history_store.load_index(project_path, last_n=10)
         anchor_id = recent_candidates[0]["id"] if recent_candidates else None
         selected = [anchor_id] if anchor_id else []
         used = recent_candidates[0]["stats"].get("tokens", 0) if recent_candidates else 0
 
-        # Score remaining candidates; skip-not-stop to fill budget
-        scored = history_store.score_chunks(candidates, user_message)
-        for _, entry in scored:
+        # Pool 1 — vector search (semantic similarity to user message)
+        vector_candidates = history_store.search_by_vector(project_path, user_message, limit=20)
+
+        # Pool 2 — tag matching fallback (used when no OPENAI_API_KEY or no embeddings yet)
+        if not vector_candidates:
+            msg_tags = history_store.extract_tags(user_message)
+            tag_candidates = history_store.query_by_tags(project_path, msg_tags, limit=30)
+            scored = history_store.score_chunks(tag_candidates + recent_candidates, user_message)
+            candidates = [entry for _, entry in scored]
+        else:
+            # Merge vector results with recency pool, dedup by id
+            seen: set = set(selected)
+            candidates = []
+            for entry in vector_candidates + recent_candidates:
+                if entry["id"] not in seen:
+                    seen.add(entry["id"])
+                    candidates.append(entry)
+
+        if not candidates and not selected:
+            return "no history yet"
+
+        # Fill token budget from candidates
+        for entry in candidates:
             if entry["id"] == anchor_id:
                 continue
             t = entry["stats"].get("tokens", 0)

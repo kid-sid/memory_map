@@ -1,11 +1,10 @@
 """
 Shared history storage layer used by history_hook.py and server.py.
 
-MongoDB when MEMORY_MAP_MONGO_URI is set; JSON fallback (.mcp_history.json) otherwise.
+MongoDB only — MEMORY_MAP_MONGO_URI must be set in .env.
 Zero LLM calls — tags are extracted by local keyword matching.
 """
 
-import json
 import logging
 import math
 import os
@@ -15,13 +14,35 @@ import datetime
 
 logger = logging.getLogger(__name__)
 
-import portalocker
 from dotenv import load_dotenv
 
 load_dotenv(pathlib.Path(__file__).parent / ".env")
 
-HISTORY_FILE = ".mcp_history.json"
-MAX_JSON_CHUNKS = 100
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIMS = 1536
+
+# "openai"  → generate embeddings via OpenAI, store on doc, search with queryVector
+# "atlas"   → Atlas autoEmbed (Voyage-4), no client-side embedding, search with queryText
+# ""        → no vector search, fall back to keyword tag matching
+EMBED_PROVIDER = os.environ.get("MEMORY_MAP_EMBED_PROVIDER", "").lower()
+
+ATLAS_AUTOEMBED_INDEX = "history_autoembed_index"
+ATLAS_VECTOR_INDEX = "history_vector_index"
+
+
+def _embed(text: str) -> list | None:
+    """Return an OpenAI embedding vector, or None on failure. Only used when EMBED_PROVIDER=openai."""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        logger.warning("memory_map: OPENAI_API_KEY not set — skipping embedding")
+        return None
+    try:
+        from openai import OpenAI
+        response = OpenAI(api_key=api_key).embeddings.create(model=EMBED_MODEL, input=text[:8000])
+        return response.data[0].embedding
+    except Exception as exc:
+        logger.warning("memory_map: OpenAI embedding failed (%s) — chunk saved without vector", exc)
+        return None
 
 # Per-tag keyword sets.  The dialogue is lowercased before matching, so all
 # entries here must be lowercase.  Longer / more specific terms score higher
@@ -79,12 +100,14 @@ def _get_collection():
 
     uri = os.environ.get("MEMORY_MAP_MONGO_URI", "")
     if not uri:
-        return None
+        raise RuntimeError(
+            "memory_map: MEMORY_MAP_MONGO_URI is not set. "
+            "Add it to your .env file to connect to MongoDB Atlas."
+        )
 
-    require_mongo = os.environ.get("MEMORY_MAP_REQUIRE_MONGO", "").lower() in ("1", "true", "yes")
     try:
-        from pymongo import MongoClient  # optional dependency
-        client = MongoClient(uri, serverSelectionTimeoutMS=1000)
+        from pymongo import MongoClient
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
         client.admin.command("ping")
         col = client["memory_map"]["history"]
         col.create_index([("project", 1), ("timestamp", -1)], background=True)
@@ -92,15 +115,9 @@ def _get_collection():
         _mongo_col = col
         logger.info("memory_map: connected to MongoDB at %s", uri)
     except Exception as exc:
-        if require_mongo:
-            raise RuntimeError(
-                f"memory_map: MongoDB required but unreachable at {uri!r}: {exc}"
-            ) from exc
-        logger.warning(
-            "memory_map: MongoDB unreachable (%s) — falling back to JSON storage. "
-            "Start MongoDB or remove MEMORY_MAP_MONGO_URI from .env to silence this.",
-            exc,
-        )
+        raise RuntimeError(
+            f"memory_map: MongoDB unreachable at {uri!r}: {exc}"
+        ) from exc
 
     return _mongo_col
 
@@ -126,88 +143,149 @@ def extract_tags(dialogue: str) -> list:
         hits = sum(1 for kw in keywords if kw in text)
         if hits:
             scores[tag] = hits
-    # Sort by score descending, return top 5 tag names
     return [tag for tag, _ in sorted(scores.items(), key=lambda x: -x[1])][:5]
 
 
 def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
                group_id: str = None, part: int = None, total_parts: int = None) -> str:
-    """Persist a history chunk. Returns the assigned chunk ID.
-
-    group_id / part / total_parts are set only when a Q&A pair was split into
-    multiple overlapping chunks so callers can reassemble them.
-    """
+    """Persist a history chunk to MongoDB. Returns the inserted ObjectId as string."""
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     stats = compute_stats(dialogue)
-    preview = dialogue[:100]
-
-    col = _get_collection()
-    if col is not None:
-        doc = {
-            "project": project,
-            "session_id": session_id,
-            "timestamp": ts,
-            "dialogue": dialogue,
-            "preview": preview,
-            "tags": tags,
-            "stats": stats,
-        }
-        if group_id is not None:
-            doc["group_id"] = group_id
-            doc["part"] = part
-            doc["total_parts"] = total_parts
-        result = col.insert_one(doc)
-        return str(result.inserted_id)
-
-    return _json_save(project, session_id, ts, dialogue, preview, tags, stats,
-                      group_id=group_id, part=part, total_parts=total_parts)
+    doc = {
+        "project": project,
+        "session_id": session_id,
+        "timestamp": ts,
+        "dialogue": dialogue,
+        "preview": dialogue[:100],
+        "tags": tags,
+        "stats": stats,
+    }
+    if EMBED_PROVIDER == "openai":
+        embedding = _embed(dialogue)
+        if embedding is not None:
+            doc["embedding"] = embedding
+    # atlas provider: autoEmbed generates the vector on insert — no client-side work needed
+    if group_id is not None:
+        doc["group_id"] = group_id
+        doc["part"] = part
+        doc["total_parts"] = total_parts
+    result = _get_collection().insert_one(doc)
+    return str(result.inserted_id)
 
 
 def load_index(project: str, last_n: int = 20) -> list:
-    """Return tag index records (no full dialogue)."""
-    col = _get_collection()
-    if col is not None:
-        return _mongo_load_index(col, project, last_n)
-    return _json_load_index(project, last_n)
+    """Return tag index records (no full dialogue), newest first."""
+    cursor = _get_collection().find(
+        {"project": project},
+        {"dialogue": 0},
+    ).sort("timestamp", -1).limit(last_n)
+    return [{
+        "id": str(doc["_id"]),
+        "timestamp": doc.get("timestamp", ""),
+        "tags": doc.get("tags", []),
+        "preview": doc.get("preview", ""),
+        "stats": doc.get("stats", {}),
+    } for doc in cursor]
 
 
 def query_by_tags(project: str, tags: list, limit: int = 30) -> list:
-    """Return index entries (no dialogue) for chunks matching any of the given tags.
-
-    Sorted newest-first. Same dict shape as load_index entries.
-    Returns [] immediately when tags is empty.
-    """
+    """Return index entries for chunks matching any of the given tags, newest first."""
     if not tags:
         return []
-    col = _get_collection()
-    if col is not None:
-        return _mongo_query_by_tags(col, project, tags, limit)
-    return _json_query_by_tags(project, tags, limit)
+    cursor = _get_collection().find(
+        {"project": project, "tags": {"$in": tags}},
+        {"dialogue": 0},
+    ).sort("timestamp", -1).limit(limit)
+    return [{
+        "id": str(doc["_id"]),
+        "timestamp": doc.get("timestamp", ""),
+        "tags": doc.get("tags", []),
+        "preview": doc.get("preview", ""),
+        "stats": doc.get("stats", {}),
+    } for doc in cursor]
 
 
 def get_chunks(project: str, ids: list) -> tuple:
     """Fetch full chunks by ID list. Returns (chunks, total_tokens)."""
-    col = _get_collection()
-    if col is not None:
-        chunks = _mongo_get_chunks(col, ids)
-    else:
-        chunks = _json_get_chunks(project, ids)
+    from bson import ObjectId
+    oids = []
+    for id_str in ids:
+        try:
+            oids.append(ObjectId(id_str))
+        except Exception:
+            pass
+    docs = list(_get_collection().find({"_id": {"$in": oids}}).sort("timestamp", -1))
+    chunks = [{
+        "id": str(doc["_id"]),
+        "timestamp": doc.get("timestamp", ""),
+        "session_id": doc.get("session_id", ""),
+        "dialogue": doc.get("dialogue", ""),
+        "tags": doc.get("tags", []),
+        "stats": doc.get("stats", {}),
+    } for doc in docs]
     total_tokens = sum(c.get("stats", {}).get("tokens", 0) for c in chunks)
     return chunks, total_tokens
 
 
 def get_latest_save(project: str) -> str:
     """Return ISO timestamp of the most recent chunk, or ''."""
-    col = _get_collection()
-    if col is not None:
-        doc = col.find_one(
-            {"project": project},
-            {"timestamp": 1},
-            sort=[("timestamp", -1)],
-        )
-        return doc.get("timestamp", "") if doc else ""
-    data = _json_read(project)
-    return data.get("_meta", {}).get("last_save", "")
+    doc = _get_collection().find_one(
+        {"project": project},
+        {"timestamp": 1},
+        sort=[("timestamp", -1)],
+    )
+    return doc.get("timestamp", "") if doc else ""
+
+
+def search_by_vector(project: str, query: str, limit: int = 5) -> list:
+    """Return semantically similar chunks using Atlas Vector Search.
+
+    Provider is selected by MEMORY_MAP_EMBED_PROVIDER:
+      "openai" → client-side OpenAI embeddings + history_vector_index (queryVector)
+      "atlas"  → Atlas autoEmbed (Voyage-4) + history_autoembed_index (queryText)
+      ""       → returns [] so suggest_history falls back to tag matching
+    """
+    if EMBED_PROVIDER == "openai":
+        embedding = _embed(query)
+        if embedding is None:
+            return []
+        vector_search = {
+            "index": ATLAS_VECTOR_INDEX,
+            "path": "embedding",
+            "queryVector": embedding,
+            "numCandidates": limit * 10,
+            "limit": limit,
+            "filter": {"project": {"$eq": project}},
+        }
+        exclude_fields = {"dialogue": 0, "embedding": 0}
+
+    elif EMBED_PROVIDER == "atlas":
+        vector_search = {
+            "index": ATLAS_AUTOEMBED_INDEX,
+            "path": "dialogue",
+            "queryText": query,
+            "numCandidates": limit * 10,
+            "limit": limit,
+            "filter": {"project": {"$eq": project}},
+        }
+        exclude_fields = {"dialogue": 0}
+
+    else:
+        return []
+
+    pipeline = [
+        {"$vectorSearch": vector_search},
+        {"$project": {**exclude_fields, "score": {"$meta": "vectorSearchScore"}}},
+    ]
+    docs = list(_get_collection().aggregate(pipeline))
+    return [{
+        "id": str(doc["_id"]),
+        "timestamp": doc.get("timestamp", ""),
+        "tags": doc.get("tags", []),
+        "preview": doc.get("preview", ""),
+        "stats": doc.get("stats", {}),
+        "score": doc.get("score", 0.0),
+    } for doc in docs]
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +308,6 @@ def score_chunks(index: list, user_message: str) -> list:
 
     scored = []
     for entry in index:
-        # Signal 1 — tag-keyword match
         tags = entry.get("tags", [])
         tag_hits = sum(
             1 for tag in tags
@@ -238,7 +315,6 @@ def score_chunks(index: list, user_message: str) -> list:
         )
         tag_score = tag_hits / len(tags) if tags else 0.0
 
-        # Signal 2 — recency decay (half-life = 3 days)
         try:
             ts = datetime.datetime.strptime(
                 entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ"
@@ -248,7 +324,6 @@ def score_chunks(index: list, user_message: str) -> list:
             age_days = 999
         recency_score = math.exp(-age_days * math.log(2) / 3)
 
-        # Signal 3 — preview word overlap
         preview_words = set(
             re.sub(r"[^\w\s]", " ", entry.get("preview", "").lower()).split()
         )
@@ -258,173 +333,3 @@ def score_chunks(index: list, user_message: str) -> list:
         scored.append((combined, entry))
 
     return sorted(scored, key=lambda x: -x[0])
-
-
-# ---------------------------------------------------------------------------
-# MongoDB backend
-# ---------------------------------------------------------------------------
-
-def _mongo_load_index(col, project: str, last_n: int) -> list:
-    cursor = col.find(
-        {"project": project},
-        {"dialogue": 0},
-    ).sort("timestamp", -1).limit(last_n)
-    results = []
-    for doc in cursor:
-        results.append({
-            "id": str(doc["_id"]),
-            "timestamp": doc.get("timestamp", ""),
-            "tags": doc.get("tags", []),
-            "preview": doc.get("preview", ""),
-            "stats": doc.get("stats", {}),
-        })
-    return results  # newest first (timestamp DESC)
-
-
-def _mongo_query_by_tags(col, project: str, tags: list, limit: int) -> list:
-    cursor = col.find(
-        {"project": project, "tags": {"$in": tags}},
-        {"dialogue": 0},
-    ).sort("timestamp", -1).limit(limit)
-    return [
-        {
-            "id": str(doc["_id"]),
-            "timestamp": doc.get("timestamp", ""),
-            "tags": doc.get("tags", []),
-            "preview": doc.get("preview", ""),
-            "stats": doc.get("stats", {}),
-        }
-        for doc in cursor
-    ]
-
-
-def _mongo_get_chunks(col, ids: list) -> list:
-    from bson import ObjectId  # pymongo must be installed for MongoDB path
-    oids = []
-    for id_str in ids:
-        try:
-            oids.append(ObjectId(id_str))
-        except Exception:
-            pass
-    docs = list(col.find({"_id": {"$in": oids}}).sort("timestamp", -1))
-    return [{
-        "id": str(doc["_id"]),
-        "timestamp": doc.get("timestamp", ""),
-        "session_id": doc.get("session_id", ""),
-        "dialogue": doc.get("dialogue", ""),
-        "tags": doc.get("tags", []),
-        "stats": doc.get("stats", {}),
-    } for doc in docs]
-
-
-# ---------------------------------------------------------------------------
-# JSON fallback backend
-# ---------------------------------------------------------------------------
-
-def _json_path(project: str) -> pathlib.Path:
-    return pathlib.Path(project).resolve() / HISTORY_FILE
-
-
-def _json_read(project: str) -> dict:
-    p = _json_path(project)
-    if not p.exists():
-        return {"_meta": {}, "chunks": []}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {"_meta": {}, "chunks": []}
-
-
-def _json_write(project: str, data: dict):
-    p = _json_path(project)
-    with open(p, "w", encoding="utf-8") as f:
-        portalocker.lock(f, portalocker.LOCK_EX)
-        json.dump(data, f, indent=2)
-        portalocker.unlock(f)
-
-
-def _json_save(project: str, session_id: str, ts: str,
-               dialogue: str, preview: str, tags: list, stats: dict,
-               group_id: str = None, part: int = None, total_parts: int = None) -> str:
-    data = _json_read(project)
-    chunks = data.get("chunks", [])
-
-    try:
-        next_id = str(int(chunks[-1].get("id", 0)) + 1) if chunks else "1"
-    except (ValueError, TypeError):
-        next_id = str(len(chunks) + 1)
-
-    chunk = {
-        "id": next_id,
-        "session_id": session_id,
-        "timestamp": ts,
-        "dialogue": dialogue,
-        "preview": preview,
-        "tags": tags,
-        "stats": stats,
-    }
-    if group_id is not None:
-        chunk["group_id"] = group_id
-        chunk["part"] = part
-        chunk["total_parts"] = total_parts
-    chunks.append(chunk)
-
-    if len(chunks) > MAX_JSON_CHUNKS:
-        chunks = chunks[-MAX_JSON_CHUNKS:]
-
-    data["chunks"] = chunks
-    data["_meta"]["last_save"] = ts
-    _json_write(project, data)
-    return next_id
-
-
-def _json_load_index(project: str, last_n: int) -> list:
-    chunks = list(reversed(_json_read(project).get("chunks", [])[-last_n:]))
-    return [{
-        "id": str(c.get("id", "")),
-        "timestamp": c.get("timestamp", ""),
-        "tags": c.get("tags", []),
-        "preview": c.get("preview", c.get("dialogue", "")[:100]),
-        "stats": c.get("stats", {}),
-    } for c in chunks]
-
-
-def _json_query_by_tags(project: str, tags: list, limit: int) -> list:
-    tag_set = set(tags)
-    all_chunks = _json_read(project).get("chunks", [])
-    matches = [c for c in all_chunks if tag_set & set(c.get("tags", []))]
-    matches = sorted(matches, key=lambda c: c.get("timestamp", ""), reverse=True)[:limit]
-    return [
-        {
-            "id": str(c.get("id", "")),
-            "timestamp": c.get("timestamp", ""),
-            "tags": c.get("tags", []),
-            "preview": c.get("preview", c.get("dialogue", "")[:100]),
-            "stats": c.get("stats", {}),
-        }
-        for c in matches
-    ]
-
-
-def _json_get_chunks(project: str, ids: list) -> list:
-    id_set = set(ids)
-    result = []
-    for c in _json_read(project).get("chunks", []):
-        if str(c.get("id", "")) not in id_set:
-            continue
-        entry = {
-            "id": str(c.get("id", "")),
-            "timestamp": c.get("timestamp", ""),
-            "session_id": c.get("session_id", ""),
-            # support old 'summary' key for chunks saved before the redesign
-            "dialogue": c.get("dialogue", c.get("summary", "")),
-            "tags": c.get("tags", []),
-            "stats": c.get("stats", {}),
-        }
-        if c.get("group_id") is not None:
-            entry["group_id"] = c["group_id"]
-            entry["part"] = c.get("part")
-            entry["total_parts"] = c.get("total_parts")
-        result.append(entry)
-    return result
