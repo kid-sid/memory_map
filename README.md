@@ -7,8 +7,9 @@ An MCP server that gives Claude persistent memory and conversation history — s
 - **Project structure** — local directory tree or any GitHub repo, `.gitignore`-aware
 - **Git history** — recent commits in a compact format
 - **Session memory** — save context once, Claude loads it automatically at session start
-- **Conversation history** — automatically summarizes past conversations so Claude stays in context across sessions
+- **Conversation history** — saves each Q&A pair as its own document; Claude retrieves the most relevant chunks by tag and token budget at session start
 - **Compression** — memory output is token-optimized at 3 levels (raw / compact / dense)
+- **Multi-project** — browse memory and history across all your projects from a single tool call
 - **Manual save** — `/mem_save` slash command to checkpoint the conversation any time
 
 ---
@@ -18,7 +19,7 @@ An MCP server that gives Claude persistent memory and conversation history — s
 - Python 3.10+
 - Git installed and on your PATH
 - [Claude Code](https://claude.ai/code) CLI installed
-- (Optional) OpenAI API key — needed for AI-powered history summarization
+- (Optional) MongoDB — local or Atlas — for persistent history storage. Falls back to a local JSON file if not configured.
 
 ---
 
@@ -45,14 +46,68 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Note the full path to `server.py` — you'll need it in the next step.
-Example: `C:/Users/yourname/memory_map/server.py`
+---
+
+### Step 2 — Configure environment variables
+
+Create a `.env` file in the repo root:
+
+```bash
+# MongoDB connection string (optional — falls back to JSON if not set)
+# Local:  mongodb://localhost:27017
+# Atlas:  mongodb+srv://<user>:<password>@<cluster>.mongodb.net
+MEMORY_MAP_MONGO_URI=
+
+# GitHub token for higher API rate limits and private repos (optional)
+# GITHUB_TOKEN=
+```
+
+If `MEMORY_MAP_MONGO_URI` is left blank, history is stored in `.mcp_history.json` per project.
 
 ---
 
-### Step 2 — Register the MCP server with Claude Code
+### Step 2b — MongoDB setup (optional)
 
-Run this once (replace the path with your actual path). The `-s user` flag makes it available in **all projects**, not just the current one.
+By default, conversation history is stored in a `.mcp_history.json` file per project (up to 100 chunks). MongoDB is optional but gives you unlimited history, persistence across reinstalls, and faster indexed lookups.
+
+**Install MongoDB Community Server**
+
+Download from [mongodb.com/try/download/community](https://www.mongodb.com/try/download/community).
+
+During installation on Windows, tick **"Install MongoDB as a Windows Service"** — this starts MongoDB automatically on boot. You will never need to open Compass or start it manually.
+
+**Add the URI to your `.env` file:**
+
+```
+MEMORY_MAP_MONGO_URI=mongodb://localhost:27017
+```
+
+That's all. The server creates the database and collection automatically on first use — no migrations, no `CREATE TABLE`.
+
+**Where MongoDB stores data**
+
+| | Default path |
+|---|---|
+| Data files | `C:\Program Files\MongoDB\Server\<version>\data\` |
+| Log files | `C:\Program Files\MongoDB\Server\<version>\log\` |
+| Database | `memory_map` (created automatically) |
+| Collection | `memory_map.history` (created automatically) |
+
+**Require MongoDB (no JSON fallback)**
+
+If you want the server to error loudly instead of silently falling back to JSON when MongoDB is unreachable, add:
+
+```
+MEMORY_MAP_REQUIRE_MONGO=1
+```
+
+Without this flag, the server falls back to JSON with a warning if MongoDB is down. With it, every tool call fails with a clear error until MongoDB is reachable — useful if you rely on MongoDB history and never want silent data splitting.
+
+---
+
+### Step 3 — Register the MCP server with Claude Code
+
+Run this once (replace the path with your actual path). The `-s user` flag makes it available in **all projects**.
 
 **Windows with venv:**
 ```bash
@@ -68,7 +123,7 @@ Restart Claude Code after running this.
 
 ---
 
-### Step 3 — Verify the server is connected
+### Step 4 — Verify the server is connected
 
 Open Claude Code and run:
 
@@ -76,11 +131,11 @@ Open Claude Code and run:
 /mcp
 ```
 
-You should see `memory_map` listed with 9 tools. If it's not there, double-check the path in Step 2.
+You should see `memory_map` listed with 17 tools. If it's not there, double-check the path in Step 3.
 
 ---
 
-### Step 4 — Enable session memory for a project
+### Step 5 — Enable session memory for a project
 
 Copy `CLAUDE.md` into the root of any project you want Claude to remember:
 
@@ -94,31 +149,89 @@ copy C:\Users\yourname\memory_map\CLAUDE.md C:\Users\yourname\your-project\CLAUD
 cp ~/memory_map/CLAUDE.md ~/your-project/CLAUDE.md
 ```
 
-Claude Code reads `CLAUDE.md` automatically at session start — this tells it to call `load_memory` and `load_history` before doing anything else.
+Claude Code reads `CLAUDE.md` automatically at session start — this tells it to call `load_memory` and `suggest_history` before doing anything else.
 
 ---
 
-### Step 5 — Enable automatic conversation history (optional)
+## Using memory_map in other projects
 
-This feature auto-summarizes your conversations every 10 messages and stores them in `.mcp_history.json`. It uses GPT-4o-mini, so you'll need an OpenAI API key.
+The MCP server and history hook are registered globally, so they work in every project automatically. The only per-project step is dropping a `CLAUDE.md` file.
 
-**Set your API key:**
+### What you do once per project
 
-Windows:
-```bash
-$env:OPENAI_API_KEY = "sk-..."
+Copy the `CLAUDE.md` from this repo into your project root (see Step 5 above). That file instructs Claude to load memory and history at the start of every session.
+
+You do **not** need to:
+- Re-register the MCP server
+- Change the hook configuration
+- Create any database or collection
+- Set up any project-specific config
+
+### How history is tracked per project
+
+The hook receives the **current working directory** from Claude Code on every trigger. That path is used as the project namespace — so `C:\projects\my-api` and `C:\projects\dashboard` each get completely separate history, even though they share the same MCP server and the same MongoDB collection.
+
+```
+my-api session  → chunks stored under project: "C:/projects/my-api"
+dashboard session → chunks stored under project: "C:/projects/dashboard"
 ```
 
-Mac/Linux:
-```bash
-export OPENAI_API_KEY="sk-..."
+Nothing bleeds between projects.
+
+### What gets saved automatically
+
+| Event | What happens |
+|---|---|
+| `UserPromptSubmit` | Each completed Q&A pair is saved as its own document |
+| `PreCompact` | All unsaved pairs are flushed before context compression |
+| `Stop` | All unsaved pairs are flushed when the session ends |
+
+No manual action needed. Each save extracts intent tags (`bug-fix`, `database`, `feature`, etc.) by local keyword matching — no LLM calls, no API keys. File edits and shell commands made during the response are also captured alongside the dialogue text.
+
+If a Q&A pair exceeds 4000 characters, it is automatically split into overlapping chunks linked by a shared `group_id` so context at chunk boundaries is never lost.
+
+### What Claude does at session start
+
+When you open a project that has `CLAUDE.md`:
+
+1. Calls `load_memory(project_path)` — loads all saved key-value context for this project
+2. Calls `suggest_history(project_path, first_user_message)` — scores history chunks by relevance to your first message and returns the best fit within a token budget
+3. Has full project context before touching a single file
+
+### Where history is stored
+
+| Backend | Storage location |
+|---|---|
+| JSON (default) | `<your-project>/.mcp_history.json` — one file, stays in the project directory |
+| MongoDB | `memory_map.history` collection — filtered by `project` field (the `cwd`) |
+
+### Per-project memory keys
+
+Use short lowercase keys. Suggested starting set:
+
+| Key | What to store |
+|---|---|
+| `stack` | Languages, frameworks, databases in use |
+| `current_work` | What is actively being built or fixed |
+| `gotchas` | Non-obvious constraints, footguns, rules to never break |
+| `key_files` | The most important files and what they do |
+
+Claude saves these automatically as it learns your project. You can also save them manually:
+
+```
+save_memory("C:/projects/my-api", "stack", "FastAPI + Postgres + Redis")
+save_memory("C:/projects/my-api", "gotchas", "never bypass the rate limiter middleware")
 ```
 
-To make it permanent, add the export to your shell profile (`.bashrc`, `.zshrc`, or Windows environment variables).
+---
+
+### Step 6 — Enable automatic conversation history
+
+This auto-saves each Q&A pair as it happens — no API key required.
 
 **Configure the hooks globally in `~/.claude/settings.json`:**
 
-Adding hooks here means history is saved automatically in **every project** — no per-project setup needed. Replace the path to match where you cloned this repo.
+Replace the path to match where you cloned this repo.
 
 **Windows (`C:\Users\yourname\.claude\settings.json`):**
 ```json
@@ -210,9 +323,7 @@ Adding hooks here means history is saved automatically in **every project** — 
 }
 ```
 
-Restart Claude Code. History will now be saved automatically every 10 messages, on context compaction, and when the session ends.
-
-> **Without an OpenAI key:** The hook still works — it saves a raw truncated excerpt instead of an AI summary.
+Restart Claude Code. History will now be saved automatically after every Q&A pair, on context compaction, and when the session ends.
 
 ---
 
@@ -236,15 +347,46 @@ No file reading. No re-explaining the codebase. Context in one tool call.
 
 ## How conversation history works
 
-Every 10 user messages, the hook reads your conversation transcript, sends it to GPT-4o-mini, and saves a dense summary to `.mcp_history.json`. At session start, Claude calls `load_history` and gets the last 5 summaries — so it knows what you were working on even after days away.
+After every Q&A exchange, the hook saves the dialogue to MongoDB (or a local JSON file). Each pair becomes its own document — no mixed-topic blobs. Tags are extracted by **local keyword matching** — no LLM calls, no API keys needed.
 
-A rolling window of 20 chunks is kept. Older ones are dropped automatically.
+**What gets captured per pair:**
+- The user message (text)
+- The assistant's full response, including text commentary, file edits (`[Edit: path]`), writes (`[Write: path]`), and shell commands (`[Bash: ...]`)
+
+**At session start**, Claude calls `suggest_history`, which uses a hybrid retrieval strategy:
+
+1. **Tag pool** — finds chunks across all history (any age) whose tags match the user's first message keywords
+2. **Recency pool** — always loads the last 10 chunks as a continuity fallback
+3. **Anchor** — the most recent chunk is always included for session continuity
+4. **Relevance scoring** — ranks candidates by tag-keyword match (50%), recency decay (30%), and preview word overlap (20%), then selects the best fit within a token budget
+
+```
+=== Relevant History (3 chunks, 650 tokens) ===
+
+[abc123] 2026-05-07T09:40:49Z tags:[bug-fix,database]
+user: postgres migration failed — column already exists
+assistant: added IF NOT EXISTS to the ALTER TABLE statement
+...
+```
+
+This means Claude can surface a relevant chunk from 3 months ago if it matches your current task — not just whatever you worked on last.
+
+**Tag vocabulary** (extracted automatically from dialogue content):
+
+`api-design` · `architecture` · `auth` · `bug-fix` · `configuration` · `data-pipeline` · `database` · `debugging` · `deployment` · `documentation` · `feature` · `memory` · `performance` · `refactor` · `testing` · `tooling`
+
+**Storage backends:**
+
+| Backend | When used | Capacity |
+|---|---|---|
+| MongoDB | `MEMORY_MAP_MONGO_URI` is set | Unlimited, indexed by tag and timestamp |
+| JSON file (`.mcp_history.json`) | No URI configured | Up to 100 chunks per project |
 
 ---
 
 ## Memory compression
 
-Memory output is compressed at read time to save tokens. Three levels are available:
+Memory output is compressed at read time to save tokens. Three levels:
 
 | Level | Format | Example |
 |---|---|---|
@@ -252,50 +394,107 @@ Memory output is compressed at read time to save tokens. Three levels are availa
 | `1` (compact, default) | `[key] value` | `[stack] Python server using fastmcp` |
 | `2` (dense) | abbreviated keys + values | `[stack] py srv using fastmcp` |
 
-Set the level per project:
 ```
 set_compression(project_path, 1)
 ```
 
 ---
 
+## Multi-project support
+
+Browse and search memory across all your projects at once:
+
+```
+list_projects(base_path)                         # all projects with saved memory
+get_project_summary(project_path)                # memory + recent history for one project
+load_cross_project_memory(base_path, "stack")    # load a specific key from all projects
+search_across_projects(base_path, "postgres")    # search memory values across all projects
+save_global_memory("name", "Sidhartha")          # user-level facts available in all projects
+load_global_memory()                             # load global facts
+```
+
+---
+
 ## Manual history save — `/mem_save`
 
-Type `/mem_save` in Claude Code at any time to immediately checkpoint the recent conversation. Claude will summarize what was discussed and call `save_history` for you.
+Type `/mem_save` in Claude Code at any time to immediately checkpoint the recent conversation. Claude summarizes what was discussed and calls `save_history`.
 
-This is useful when conversations get long, before switching topics, or before closing a session mid-task.
+Useful when conversations get long, before switching topics, or before closing a session mid-task.
 
 ---
 
 ## Tools reference
+
+### Structure & Git
 
 | Tool | Args | Description |
 |---|---|---|
 | `get_local_structure` | `path`, `max_depth=5` | Directory tree of a local folder |
 | `get_github_structure` | `repo`, `branch="main"` | File tree of a GitHub repo (`owner/repo`) |
 | `get_git_history` | `path`, `count=5` | Recent commits as `hash \| subject` |
+
+### Memory
+
+| Tool | Args | Description |
+|---|---|---|
 | `save_memory` | `project_path`, `key`, `content` | Save or update a context entry |
 | `load_memory` | `project_path` | Load all saved context (compressed) |
 | `delete_memory` | `project_path`, `key` | Remove a specific entry |
 | `set_compression` | `project_path`, `level` | Set compression level (0, 1, or 2) |
-| `save_history` | `project_path`, `summary`, `session_id` | Save a conversation history chunk |
-| `load_history` | `project_path`, `last_n=5` | Load recent conversation summaries |
+
+### Conversation History
+
+| Tool | Args | Description |
+|---|---|---|
+| `suggest_history` | `project_path`, `user_message`, `token_budget=2000` | **Primary session-start tool.** Returns the most relevant history chunks — combines tag-matched (any age) + recent chunks, always includes the latest, scores by relevance and recency |
+| `save_history` | `project_path`, `dialogue`, `session_id`, `tags` | Save a raw conversation chunk with auto-extracted tags |
+| `load_history` | `project_path`, `last_n=5` | Load the tag index for recent chunks (id, timestamp, tags, preview, token cost) — use for inspection or `/mem_save` flow |
+| `get_history_chunks` | `project_path`, `ids` | Fetch full dialogue for comma-separated chunk IDs + total token sum |
+
+### Multi-project
+
+| Tool | Args | Description |
+|---|---|---|
+| `list_projects` | `base_path` | List all projects with saved memory under a directory |
+| `get_project_summary` | `project_path` | Memory keys + recent history tag index for a project |
+| `load_cross_project_memory` | `base_path`, `query_keys` | Aggregate memory across all projects, optionally filter by key |
+| `search_across_projects` | `base_path`, `keyword` | Full-text search across all project memory values |
+| `save_global_memory` | `key`, `content` | Save a user-level fact available in all projects |
+| `load_global_memory` | — | Load all global facts |
 
 ---
 
-## Optional — GitHub token for private repos
+## Environment variables
 
-Without a token, GitHub API allows 60 requests/hour. For private repos or higher limits:
+| Variable | Default | Description |
+|---|---|---|
+| `MEMORY_MAP_MONGO_URI` | _(unset)_ | MongoDB connection string. Falls back to JSON if not set. |
+| `MEMORY_MAP_REQUIRE_MONGO` | _(unset)_ | Set to `1` to error instead of falling back to JSON when MongoDB is unreachable. |
+| `GITHUB_TOKEN` | _(unset)_ | GitHub token for private repos / higher rate limits |
+| `MCP_MAX_ENTRY_KB` | `10` | Max size per memory entry in KB |
+| `MCP_GIT_TIMEOUT` | `10` | Timeout in seconds for git commands |
+| `MCP_MAX_TURN_CHARS` | `3000` | Max characters captured per turn before truncation |
+| `MCP_MAX_CHUNK_CHARS` | `4000` | Max characters per saved history chunk; larger Q&A pairs are split into overlapping chunks |
+| `MCP_OVERLAP_CHARS` | `100` | Overlap between split chunks so context at boundaries is preserved |
+| `MCP_WORKSPACE_ROOT` | _(unset)_ | When set, all `project_path` / `base_path` / `path` arguments must resolve inside this directory. Recommended for shared or multi-project setups. |
 
-**Windows:**
+---
+
+## Running tests
+
 ```bash
-$env:GITHUB_TOKEN = "your_token_here"
+python -m pytest tests/ -v
 ```
 
-**Mac/Linux:**
-```bash
-export GITHUB_TOKEN="your_token_here"
-```
+98 tests across 5 files:
+
+| File | Coverage |
+|---|---|
+| `test_compression.py` | 3-level compression, abbreviation, filler removal |
+| `test_history.py` | Save/load/fetch, stats, tag extraction, rolling window, split chunks, MCP tool interface, relevance scoring |
+| `test_e2e.py` | Full hook→storage→MCP retrieval journeys, per-pair saving, split chunks, token budget, suggest_history relevance |
+| `test_multi_project.py` | Cross-project tools, global memory |
+| `test_validation.py` | Key validation, size limits, corrupted JSON recovery |
 
 ---
 

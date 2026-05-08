@@ -9,6 +9,7 @@ import re
 import datetime
 
 import portalocker
+import history_store
 
 mcp = FastMCP("file-structure")
 
@@ -23,6 +24,30 @@ KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,100}$')
 MAX_ENTRY_KB = int(os.environ.get("MCP_MAX_ENTRY_KB", "10"))
 GIT_TIMEOUT = int(os.environ.get("MCP_GIT_TIMEOUT", "10"))
 GLOBAL_MEMORY_FILE = pathlib.Path.home() / ".mcp_global_memory.json"
+MAX_LOCAL_DEPTH = 10  # hard cap on get_local_structure depth
+
+_WORKSPACE_ROOT: pathlib.Path | None = (
+    pathlib.Path(os.environ["MCP_WORKSPACE_ROOT"]).resolve()
+    if "MCP_WORKSPACE_ROOT" in os.environ else None
+)
+
+
+def _validate_project_path(path: str) -> pathlib.Path:
+    """Resolve path and enforce MCP_WORKSPACE_ROOT if configured.
+
+    Always resolves symlinks and '..' components so callers never get an
+    un-normalised path.  When MCP_WORKSPACE_ROOT is set every resolved path
+    must be equal to or a sub-directory of that root.
+    """
+    resolved = pathlib.Path(path).resolve()
+    if _WORKSPACE_ROOT is not None and not (
+        resolved == _WORKSPACE_ROOT or resolved.is_relative_to(_WORKSPACE_ROOT)
+    ):
+        raise ValueError(
+            f"path '{path}' resolves to '{resolved}' which is outside the "
+            f"allowed workspace root '{_WORKSPACE_ROOT}'"
+        )
+    return resolved
 
 ABBREVIATIONS = {
     "python": "py", "javascript": "js", "typescript": "ts",
@@ -154,7 +179,11 @@ def build_local_tree(dir_path: pathlib.Path, max_depth: int, patterns: list[str]
 @mcp.tool()
 def get_local_structure(path: str, max_depth: int = 5) -> str:
     """Get the file/folder structure of a local directory as minified JSON."""
-    root = pathlib.Path(path)
+    max_depth = min(max_depth, MAX_LOCAL_DEPTH)
+    try:
+        root = _validate_project_path(path)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     if not root.exists():
         return json.dumps({"error": f"Path '{path}' does not exist"})
     if not root.is_dir():
@@ -276,28 +305,19 @@ def get_git_history(path: str, count: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 def _memory_path(project_path: str) -> pathlib.Path:
-    return pathlib.Path(project_path) / MEMORY_FILE
+    return _validate_project_path(project_path) / MEMORY_FILE
 
 
 def _history_path(project_path: str) -> pathlib.Path:
-    return pathlib.Path(project_path) / HISTORY_FILE
+    return _validate_project_path(project_path) / HISTORY_FILE
 
 
 def _read_memory(project_path: str) -> dict:
     return _load_json_safe(_memory_path(project_path), {})
 
 
-def _read_history(project_path: str) -> dict:
-    default = {"_meta": {"max_chunks": MAX_HISTORY_CHUNKS, "watermark": 0}, "chunks": []}
-    return _load_json_safe(_history_path(project_path), default)
-
-
 def _write_memory(project_path: str, data: dict) -> None:
     _locked_write(_memory_path(project_path), data)
-
-
-def _write_history(project_path: str, data: dict) -> None:
-    _locked_write(_history_path(project_path), data)
 
 
 def _read_compression_level(project_path: str) -> int:
@@ -412,49 +432,142 @@ def set_compression(project_path: str, level: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def save_history(project_path: str, summary: str, session_id: str = "") -> str:
-    """Save a conversation history chunk. Appends to a rolling buffer of recent summaries."""
+def save_history(project_path: str, summary: str, session_id: str = "", tags: str = "") -> str:
+    """Save a conversation chunk with auto-extracted tags and token stats.
+
+    tags: optional comma-separated override, e.g. "bug-fix,database".
+    If omitted, tags are extracted from summary content by keyword matching.
+    """
     try:
-        data = _read_history(project_path)
-        chunks = data.get("chunks", [])
-
-        next_id = (chunks[-1]["id"] + 1) if chunks else 1
-        chunks.append({
-            "id": next_id,
-            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-            "session": session_id[:8] if session_id else "",
-            "summary": summary,
-        })
-
-        if len(chunks) > MAX_HISTORY_CHUNKS:
-            chunks = chunks[-MAX_HISTORY_CHUNKS:]
-
-        data["chunks"] = chunks
-        _write_history(project_path, data)
-        return f"history saved: chunk {next_id}"
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        if not tag_list:
+            tag_list = history_store.extract_tags(summary)
+        chunk_id = history_store.save_chunk(project_path, session_id[:8] if session_id else "", summary, tag_list)
+        tag_str = ",".join(tag_list) if tag_list else "untagged"
+        return f"history saved: chunk {chunk_id} tags:[{tag_str}]"
     except Exception as e:
         return f"error: {e}"
 
 
 @mcp.tool()
 def load_history(project_path: str, last_n: int = 5) -> str:
-    """Load recent conversation history. Call at session start for continuity."""
+    """Load the tag index for recent history chunks. Call at session start for continuity.
+
+    Returns a lightweight index (id, timestamp, tags, preview, token cost) — no full
+    dialogue. Call get_history_chunks(ids) to fetch specific chunks in full.
+    """
     try:
-        data = _read_history(project_path)
-        chunks = data.get("chunks", [])
+        index = history_store.load_index(project_path, last_n)
+        if not index:
+            return "no history yet"
+
+        lines = [
+            "=== History Index ===",
+            "Call get_history_chunks(project_path, ids) to fetch full dialogue.",
+            "",
+        ]
+        for entry in index:
+            tag_str = ",".join(entry.get("tags", [])) or "untagged"
+            tokens = entry.get("stats", {}).get("tokens", 0)
+            preview = entry.get("preview", "")[:80].replace("\n", " ")
+            lines.append(
+                f"[{entry['id']}] {entry['timestamp']} tags:[{tag_str}] "
+                f"tokens:{tokens} preview:\"{preview}\""
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def get_history_chunks(project_path: str, ids: str) -> str:
+    """Fetch full dialogue for the given chunk IDs.
+
+    ids: comma-separated chunk IDs from load_history, e.g. "1,3" or MongoDB ObjectId strings.
+    Returns full dialogue per chunk plus total_tokens across all returned chunks.
+    """
+    try:
+        id_list = [i.strip() for i in ids.split(",") if i.strip()]
+        if not id_list:
+            return "error: no ids provided"
+        chunks, total_tokens = history_store.get_chunks(project_path, id_list)
+        if not chunks:
+            return "no chunks found for the given ids"
+
+        lines = [f"total_tokens: {total_tokens}", ""]
+        for chunk in chunks:
+            tag_str = ",".join(chunk.get("tags", [])) or "untagged"
+            lines.append(
+                f"--- [{chunk['id']}] {chunk['timestamp']} tags:[{tag_str}] ---"
+            )
+            lines.append(chunk.get("dialogue", ""))
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def suggest_history(project_path: str, user_message: str, token_budget: int = 2000) -> str:
+    """Retrieve the most relevant history chunks for the current task.
+
+    Builds candidates from two pools — tag-matched chunks (any age) and the
+    10 most recent chunks — then scores by tag-keyword match, recency decay,
+    and preview word overlap. Returns full dialogue for the best-fit chunks
+    within token_budget.
+
+    Call at session start with the user's first message instead of manually
+    calling load_history + get_history_chunks.
+    """
+    try:
+        # Pool 1 — tag-matched candidates across all history (age-independent)
+        msg_tags = history_store.extract_tags(user_message)
+        tag_candidates = history_store.query_by_tags(project_path, msg_tags, limit=30)
+
+        # Pool 2 — recency fallback (ensures recent work appears even with no tag match)
+        recent_candidates = history_store.load_index(project_path, last_n=10)
+
+        # Merge + deduplicate by id (tag candidates first)
+        seen: set = set()
+        candidates = []
+        for entry in tag_candidates + recent_candidates:
+            if entry["id"] not in seen:
+                seen.add(entry["id"])
+                candidates.append(entry)
+
+        if not candidates:
+            return "no history yet"
+
+        # Anchor: always include the most recent chunk for session continuity
+        anchor_id = recent_candidates[0]["id"] if recent_candidates else None
+        selected = [anchor_id] if anchor_id else []
+        used = recent_candidates[0]["stats"].get("tokens", 0) if recent_candidates else 0
+
+        # Score remaining candidates; skip-not-stop to fill budget
+        scored = history_store.score_chunks(candidates, user_message)
+        for _, entry in scored:
+            if entry["id"] == anchor_id:
+                continue
+            t = entry["stats"].get("tokens", 0)
+            if used + t <= token_budget:
+                selected.append(entry["id"])
+                used += t
+
+        if not selected:
+            return "no history yet"
+
+        chunks, total_tokens = history_store.get_chunks(project_path, selected)
         if not chunks:
             return "no history yet"
 
-        recent = chunks[-last_n:]
-        level = _read_compression_level(project_path)
-
-        lines = ["=== Recent History ==="]
-        for chunk in recent:
-            summary = chunk.get("summary", "")
-            if level >= 2:
-                summary = _abbreviate(summary)
-            lines.append(f"[{chunk['id']}] {summary}")
-
+        lines = [
+            f"=== Relevant History ({len(chunks)} chunks, {total_tokens} tokens) ===", ""
+        ]
+        for chunk in chunks:
+            tag_str = ",".join(chunk.get("tags", [])) or "untagged"
+            lines.append(f"[{chunk['id']}] {chunk['timestamp']} tags:[{tag_str}]")
+            lines.append(chunk.get("dialogue", ""))
+            lines.append("")
         return "\n".join(lines)
     except Exception as e:
         return f"error: {e}"
@@ -467,7 +580,10 @@ def load_history(project_path: str, last_n: int = 5) -> str:
 @mcp.tool()
 def list_projects(base_path: str) -> str:
     """List all projects under base_path that have saved memory, with key counts and last save time."""
-    root = pathlib.Path(base_path)
+    try:
+        root = _validate_project_path(base_path)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     if not root.exists() or not root.is_dir():
         return json.dumps({"error": f"'{base_path}' is not a valid directory"})
 
@@ -481,11 +597,7 @@ def list_projects(base_path: str) -> str:
                 continue
             data = _load_json_safe(mem_file, {})
             keys = [k for k in data if not k.startswith("_")]
-            hist_file = entry / HISTORY_FILE
-            last_save = ""
-            if hist_file.exists():
-                hist = _load_json_safe(hist_file, {})
-                last_save = hist.get("_meta", {}).get("last_save", "")
+            last_save = history_store.get_latest_save(str(entry))
             projects.append({
                 "path": str(entry),
                 "name": entry.name,
@@ -502,28 +614,27 @@ def list_projects(base_path: str) -> str:
 def get_project_summary(project_path: str) -> str:
     """Return a summary of a project's stored memory and recent conversation history."""
     try:
-        p = pathlib.Path(project_path)
+        p = _validate_project_path(project_path)
         name = p.name
 
         mem_data = _read_memory(project_path)
         keys = [k for k in mem_data if not k.startswith("_")]
         compression = mem_data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
 
-        hist_data = _read_history(project_path)
-        last_save = hist_data.get("_meta", {}).get("last_save", "N/A")
-        chunks = hist_data.get("chunks", [])
-        recent = chunks[-3:] if chunks else []
+        last_save = history_store.get_latest_save(project_path)
+        recent = history_store.load_index(project_path, last_n=3)
 
         lines = [
             f"Project: {name}",
             f"Keys stored: {len(keys)}",
-            f"Last history save: {last_save}",
+            f"Last history save: {last_save or 'N/A'}",
             f"Compression: level {compression}",
         ]
         if recent:
             lines.append("Recent history (last 3):")
-            for chunk in recent:
-                lines.append(f"  [{chunk['id']}] {chunk.get('summary', '')}")
+            for entry in recent:
+                tag_str = ",".join(entry.get("tags", [])) or "untagged"
+                lines.append(f"  [{entry['id']}] tags:[{tag_str}] {entry.get('preview', '')[:60]}")
 
         return "\n".join(lines)
     except Exception as e:
@@ -533,7 +644,10 @@ def get_project_summary(project_path: str) -> str:
 @mcp.tool()
 def load_cross_project_memory(base_path: str, query_keys: str = "") -> str:
     """Load memory from all projects under base_path, optionally filtered by comma-separated keys."""
-    root = pathlib.Path(base_path)
+    try:
+        root = _validate_project_path(base_path)
+    except ValueError as e:
+        return f"error: {e}"
     if not root.exists() or not root.is_dir():
         return f"error: '{base_path}' is not a valid directory"
 
@@ -565,7 +679,10 @@ def load_cross_project_memory(base_path: str, query_keys: str = "") -> str:
 @mcp.tool()
 def search_across_projects(base_path: str, keyword: str) -> str:
     """Search memory values across all projects under base_path for a keyword (case-insensitive)."""
-    root = pathlib.Path(base_path)
+    try:
+        root = _validate_project_path(base_path)
+    except ValueError as e:
+        return f"error: {e}"
     if not root.exists() or not root.is_dir():
         return f"error: '{base_path}' is not a valid directory"
     if not keyword.strip():

@@ -2,11 +2,14 @@
 """
 Claude Code hook: conversation history persistence.
 
-Fires on UserPromptSubmit (every message) and PreCompact (before compaction).
-Every 10 user messages (or on --force), reads the transcript, summarizes via
-GPT-4o-mini, and appends a chunk to .mcp_history.json in the project directory.
+Fires on UserPromptSubmit (every message), PreCompact, and Stop.
+Extracts complete Q&A pairs since the last watermark, saves each pair as its
+own MongoDB document.  If a pair exceeds MAX_CHUNK_CHARS it is split into
+overlapping chunks linked by group_id + part/total_parts.
 
-Usage (configured in .claude/settings.local.json):
+Zero LLM calls — tags extracted by local keyword matching.
+
+Usage (configured in .claude/settings.json or settings.local.json):
     echo '{"session_id":"...","transcript_path":"...","cwd":"..."}' | python history_hook.py
     echo '{"session_id":"...","transcript_path":"...","cwd":"..."}' | python history_hook.py --force
 """
@@ -16,28 +19,24 @@ import json
 import os
 import pathlib
 import tempfile
-import time
-from datetime import datetime, timezone
+import textwrap
+import uuid
+from datetime import datetime
 
-import httpx
-import portalocker
-from dotenv import load_dotenv
+import history_store
 
-load_dotenv(pathlib.Path(__file__).parent / ".env")
-
-HISTORY_FILE = ".mcp_history.json"
-MAX_CHUNKS = 20
-SAVE_INTERVAL = 10
+MAX_TURN_CHARS   = int(os.environ.get("MCP_MAX_TURN_CHARS",  "3000"))
+MAX_CHUNK_CHARS  = int(os.environ.get("MCP_MAX_CHUNK_CHARS", "4000"))
+OVERLAP_CHARS    = int(os.environ.get("MCP_OVERLAP_CHARS",   "100"))
 TEMP_FILE_TTL_DAYS = 7
 
 
 # --- Temp file cleanup ---
 
 def _cleanup_stale_temp_files():
-    """Delete session counter/watermark files older than TEMP_FILE_TTL_DAYS."""
     tmp_dir = pathlib.Path(tempfile.gettempdir())
     cutoff = datetime.now().timestamp() - TEMP_FILE_TTL_DAYS * 86400
-    for f in tmp_dir.glob("claude_hist_*.txt"):
+    for f in tmp_dir.glob("claude_hist_wm_*.txt"):
         try:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
@@ -45,27 +44,10 @@ def _cleanup_stale_temp_files():
             pass
 
 
-# --- Counter ---
-
-def _counter_path(session_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"claude_hist_{session_id[:8]}.txt"
-
+# --- Watermark (stored in OS temp dir) ---
 
 def _watermark_path(session_id: str) -> pathlib.Path:
     return pathlib.Path(tempfile.gettempdir()) / f"claude_hist_wm_{session_id[:8]}.txt"
-
-
-def increment_counter(session_id: str) -> int:
-    p = _counter_path(session_id)
-    count = 0
-    if p.exists():
-        try:
-            count = int(p.read_text().strip())
-        except (ValueError, OSError):
-            count = 0
-    count += 1
-    p.write_text(str(count))
-    return count
 
 
 def read_watermark(session_id: str) -> int:
@@ -84,18 +66,18 @@ def write_watermark(session_id: str, line_num: int):
 
 # --- Transcript parsing ---
 
-def extract_recent_dialogue(transcript_path: str, watermark: int) -> tuple[list[dict], int]:
-    """Read transcript from watermark line onwards, extract user/assistant text.
+def extract_qa_pairs(transcript_path: str, watermark: int) -> tuple:
+    """Read transcript from watermark, return (pairs, new_watermark).
 
-    Returns (exchanges, new_watermark).
+    pairs: list of {"user": str, "assistant": str} — only complete pairs.
+    new_watermark: line index AFTER the last complete pair's assistant line.
+    Any trailing unpaired user message is left for the next call.
     """
-    exchanges = []
-    total_lines = 0
+    raw = []  # list of (role, content, line_end)
 
     try:
         with open(transcript_path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
-                total_lines = i + 1
                 if i < watermark:
                     continue
 
@@ -112,127 +94,86 @@ def extract_recent_dialogue(transcript_path: str, watermark: int) -> tuple[list[
                 if entry_type not in ("user", "assistant") or role not in ("user", "assistant"):
                     continue
 
-                text = ""
+                parts = []
                 if isinstance(content, str):
                     if content.startswith("<local-command") or content.startswith("<command-name>"):
                         continue
-                    text = content.strip()
+                    t = content.strip()
+                    if t:
+                        parts.append(t)
                 elif isinstance(content, list):
-                    parts = []
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            parts.append(block.get("text", ""))
-                    text = " ".join(parts).strip()
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text":
+                            t = block.get("text", "").strip()
+                            if t:
+                                parts.append(t)
+                        elif btype == "tool_use" and role == "assistant":
+                            # Capture file-modifying tools so code changes appear in history
+                            tool_name = block.get("name", "")
+                            inp = block.get("input", {})
+                            if tool_name == "Edit":
+                                fp = inp.get("file_path", "")
+                                new_s = textwrap.dedent(inp.get("new_string", "")).strip()
+                                parts.append(f"[Edit: {fp}]\n{new_s[:400]}")
+                            elif tool_name == "Write":
+                                fp = inp.get("file_path", "")
+                                c = textwrap.dedent(inp.get("content", "")).strip()
+                                parts.append(f"[Write: {fp}]\n{c[:400]}")
+                            elif tool_name in ("Bash", "PowerShell"):
+                                cmd = inp.get("command", "")
+                                parts.append(f"[{tool_name}: {cmd[:200]}]")
 
-                if text and len(text) > 5:
-                    exchanges.append({"role": role, "content": text[:500]})
+                text = "\n".join(parts)[:MAX_TURN_CHARS]
+                if text:
+                    raw.append((role, text, i + 1))
+
     except (OSError, IOError):
         return [], watermark
 
-    return exchanges, total_lines
+    # Collapse consecutive same-role entries into turns.
+    # A complex multi-tool assistant response produces many transcript entries;
+    # we join them all so the saved pair contains the full assistant output,
+    # not just the preamble before the first tool call.
+    turns = []  # list of [role, combined_text, last_line_end]
+    for role, content, line_end in raw:
+        if turns and turns[-1][0] == role:
+            turns[-1][1] += "\n" + content
+            turns[-1][2] = line_end
+        else:
+            turns.append([role, content, line_end])
+
+    # Pair user + assistant turns
+    pairs = []
+    new_watermark = watermark
+    i = 0
+    while i < len(turns) - 1:
+        role1, content1, _ = turns[i]
+        role2, content2, line_end2 = turns[i + 1]
+        if role1 == "user" and role2 == "assistant":
+            pairs.append({"user": content1, "assistant": content2})
+            new_watermark = line_end2
+            i += 2
+        else:
+            i += 1
+
+    return pairs, new_watermark
 
 
-# --- GPT summarization with retry ---
+# --- Splitting ---
 
-def summarize_with_gpt(dialogue: str) -> str:
-    """Call OpenAI GPT-4o-mini to summarize conversation dialogue.
-
-    Retries up to 3 times with exponential backoff on transient errors.
-    Falls back to truncated raw text if all attempts fail.
-    """
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return dialogue[:300]
-
-    retryable_statuses = {429, 500, 503}
-    delays = [1, 2, 4]
-
-    for attempt, delay in enumerate(delays):
-        try:
-            resp = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Summarize this conversation into a dense, compressed format. "
-                                "Focus on: decisions made, code changes, topics discussed, "
-                                "problems solved. Use abbreviations (py, js, db, srv, auth, "
-                                "fe, be, config, env, etc). Max 200 chars. No filler words. "
-                                "Output only the summary, nothing else."
-                            ),
-                        },
-                        {"role": "user", "content": dialogue},
-                    ],
-                    "max_tokens": 150,
-                    "temperature": 0,
-                },
-                timeout=10,
-            )
-            if resp.status_code in retryable_statuses:
-                if attempt < len(delays) - 1:
-                    time.sleep(delay)
-                    continue
-                break
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        except (httpx.TimeoutException, httpx.NetworkError):
-            if attempt < len(delays) - 1:
-                time.sleep(delay)
-        except Exception:
-            break
-
-    return dialogue[:300]
-
-
-# --- History storage ---
-
-def _history_path(cwd: str) -> pathlib.Path:
-    return pathlib.Path(cwd) / HISTORY_FILE
-
-
-def read_history(cwd: str) -> dict:
-    p = _history_path(cwd)
-    if not p.exists():
-        return {"_meta": {"max_chunks": MAX_CHUNKS, "watermark": 0}, "chunks": []}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {"_meta": {"max_chunks": MAX_CHUNKS, "watermark": 0}, "chunks": []}
-
-
-def save_chunk(cwd: str, session_id: str, summary: str, watermark: int):
-    data = read_history(cwd)
-    chunks = data.get("chunks", [])
-
-    next_id = (chunks[-1]["id"] + 1) if chunks else 1
-    chunks.append({
-        "id": next_id,
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-        "session": session_id[:8],
-        "summary": summary,
-    })
-
-    if len(chunks) > MAX_CHUNKS:
-        chunks = chunks[-MAX_CHUNKS:]
-
-    data["chunks"] = chunks
-    data["_meta"]["watermark"] = watermark
-    data["_meta"]["last_session"] = session_id[:8]
-    data["_meta"]["last_save"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-
-    p = _history_path(cwd)
-    with open(p, "w", encoding="utf-8") as f:
-        portalocker.lock(f, portalocker.LOCK_EX)
-        json.dump(data, f, indent=2)
-        portalocker.unlock(f)
+def split_into_chunks(text: str) -> list:
+    """Split text into MAX_CHUNK_CHARS chunks with OVERLAP_CHARS overlap."""
+    if len(text) <= MAX_CHUNK_CHARS:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start: start + MAX_CHUNK_CHARS])
+        start += MAX_CHUNK_CHARS - OVERLAP_CHARS
+    return chunks
 
 
 # --- Main ---
@@ -256,38 +197,48 @@ def main():
         print("{}")
         return
 
-    count = increment_counter(session_id)
-
-    if not force and (count % SAVE_INTERVAL != 0):
-        print("{}")
-        return
-
     if not transcript_path or not os.path.exists(transcript_path):
         print("{}")
         return
 
     watermark = read_watermark(session_id)
+    pairs, new_watermark = extract_qa_pairs(transcript_path, watermark)
 
-    exchanges, new_watermark = extract_recent_dialogue(transcript_path, watermark)
-
-    if not exchanges:
+    if not pairs:
         print("{}")
         return
 
-    dialogue = "\n".join(f"{e['role']}: {e['content']}" for e in exchanges)
+    total_tokens = 0
+    all_tags = set()
 
-    if len(dialogue) > 4000:
-        dialogue = dialogue[:4000]
+    for pair in pairs:
+        dialogue = f"user: {pair['user']}\nassistant: {pair['assistant']}"
+        tags = history_store.extract_tags(dialogue)
+        all_tags.update(tags)
+        chunks = split_into_chunks(dialogue)
+        n = len(chunks)
+        gid = uuid.uuid4().hex[:8] if n > 1 else None
 
-    summary = summarize_with_gpt(dialogue)
-
-    save_chunk(cwd, session_id, summary, new_watermark)
+        for idx, chunk in enumerate(chunks, 1):
+            history_store.save_chunk(
+                cwd,
+                session_id[:8],
+                chunk,
+                tags,
+                group_id=gid,
+                part=(idx if n > 1 else None),
+                total_parts=(n if n > 1 else None),
+            )
+            total_tokens += history_store.compute_stats(chunk)["tokens"]
 
     write_watermark(session_id, new_watermark)
 
-    chunk_count = len(read_history(cwd).get("chunks", []))
+    tag_str = ",".join(sorted(all_tags)) if all_tags else "untagged"
+    n_pairs = len(pairs)
     output = {
-        "systemMessage": f"[history] Conversation checkpoint saved (chunk {chunk_count}/{MAX_CHUNKS})"
+        "systemMessage": (
+            f"[history] {n_pairs} pair(s) saved — tags:[{tag_str}] tokens:{total_tokens}"
+        )
     }
     print(json.dumps(output))
 

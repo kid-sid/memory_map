@@ -1,5 +1,6 @@
 fastmcp
 httpx
 portalocker
+pymongo
 python-dotenv
 pytest

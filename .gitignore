@@ -1,9 +1,16 @@
 venv/
+.venv/
 __pycache__/
+.pytest_cache/
+*.pyc
+
 .mcp_memory.json
 .mcp_history.json
-.venv/
 .env
 .vscode/
 .claude/
 CLAUDE.md
+
+# Manual dev scripts (hardcoded local paths, superseded by pytest suite)
+tests/test_client.py
+tests/quick_git_test.py
