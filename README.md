@@ -135,9 +135,41 @@ You should see `memory_map` listed with 17 tools. If it's not there, double-chec
 
 ---
 
-### Step 5 — Enable session memory for a project
+### Step 5 — Enable session memory (global or per-project)
 
-Copy `CLAUDE.md` into the root of any project you want Claude to remember:
+You have two options. **Option A is recommended** — it enables memory_map in every project without any per-project setup.
+
+#### Option A — Global CLAUDE.md (works in all projects at once)
+
+Claude Code reads `~/.claude/CLAUDE.md` automatically at the start of every session in every project. Add the session setup block there once and you're done.
+
+Open (or create) the file:
+
+| OS | Path |
+|---|---|
+| Windows | `C:\Users\yourname\.claude\CLAUDE.md` |
+| Mac/Linux | `~/.claude/CLAUDE.md` |
+
+Paste this content:
+
+```markdown
+## Session Setup (Required)
+At the start of every session, before doing anything else:
+1. Call `load_memory` with the current working directory
+2. Call `suggest_history` with the current working directory and the user's first message
+3. Read both outputs before exploring files or asking questions
+
+Save or update memory entries whenever you learn something worth keeping across sessions.
+Use short, lowercase keys: `stack`, `current_work`, `gotchas`, `key_files`. Keep values concise — one or two sentences max.
+If something loaded from memory is no longer accurate, update it with `save_memory` using the same key.
+Do not call `load_history` + `get_history_chunks` manually at session start — those are for inspection and the /mem_save flow only.
+```
+
+That's all. Every project now gets memory and history loaded automatically.
+
+#### Option B — Per-project CLAUDE.md
+
+If you only want memory_map active in specific projects, copy the file into each project root instead:
 
 **Windows:**
 ```bash
@@ -149,7 +181,7 @@ copy C:\Users\yourname\memory_map\CLAUDE.md C:\Users\yourname\your-project\CLAUD
 cp ~/memory_map/CLAUDE.md ~/your-project/CLAUDE.md
 ```
 
-Claude Code reads `CLAUDE.md` automatically at session start — this tells it to call `load_memory` and `suggest_history` before doing anything else.
+Claude Code reads any `CLAUDE.md` at the project root automatically.
 
 ---
 
