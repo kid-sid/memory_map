@@ -20,6 +20,16 @@ load_dotenv(pathlib.Path(__file__).parent / ".env")
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIMS = 1536
+EMBED_MAX_CHARS = 30000  # ~7500 tokens, safely under the model's 8192-token limit
+EMBED_RETRIES = 3
+
+# Cosine score threshold below which a vector match is considered noise.
+# Atlas vectorSearchScore is in [0, 1] where 0.5 == cosine similarity 0.
+# 0.65 corresponds to cosine ~0.30 — empirical sweet spot for text-embedding-3-small.
+MIN_VECTOR_SCORE = float(os.environ.get("MEMORY_MAP_MIN_VECTOR_SCORE", "0.65"))
+
+# Queries shorter than this are treated as too vague for semantic search.
+MIN_QUERY_CHARS = 4
 
 # "openai"  → generate embeddings via OpenAI, store on doc, search with queryVector
 # "atlas"   → Atlas autoEmbed (Voyage-4), no client-side embedding, search with queryText
@@ -31,18 +41,39 @@ ATLAS_VECTOR_INDEX = "history_vector_index"
 
 
 def _embed(text: str) -> list | None:
-    """Return an OpenAI embedding vector, or None on failure. Only used when EMBED_PROVIDER=openai."""
+    """Return an OpenAI embedding vector, or None on failure.
+
+    Retries up to EMBED_RETRIES times with exponential backoff for transient
+    failures (rate limits, network blips). Truncates to EMBED_MAX_CHARS so we
+    never exceed the model's token limit.
+    """
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         logger.warning("memory_map: OPENAI_API_KEY not set — skipping embedding")
         return None
-    try:
-        from openai import OpenAI
-        response = OpenAI(api_key=api_key).embeddings.create(model=EMBED_MODEL, input=text[:8000])
-        return response.data[0].embedding
-    except Exception as exc:
-        logger.warning("memory_map: OpenAI embedding failed (%s) — chunk saved without vector", exc)
+
+    text = text[:EMBED_MAX_CHARS] if text else ""
+    if not text.strip():
         return None
+
+    import time
+    last_exc = None
+    for attempt in range(EMBED_RETRIES):
+        try:
+            from openai import OpenAI
+            response = OpenAI(api_key=api_key).embeddings.create(model=EMBED_MODEL, input=text)
+            return response.data[0].embedding
+        except Exception as exc:
+            last_exc = exc
+            if attempt < EMBED_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning("memory_map: embedding attempt %d failed (%s), retrying in %ds",
+                               attempt + 1, exc, wait)
+                time.sleep(wait)
+
+    logger.error("memory_map: OpenAI embedding failed after %d attempts (%s) — chunk saved without vector",
+                 EMBED_RETRIES, last_exc)
+    return None
 
 # Per-tag keyword sets.  The dialogue is lowercased before matching, so all
 # entries here must be lowercase.  Longer / more specific terms score higher
@@ -237,14 +268,23 @@ def get_latest_save(project: str) -> str:
     return doc.get("timestamp", "") if doc else ""
 
 
-def search_by_vector(project: str, query: str, limit: int = 5) -> list:
+def search_by_vector(project: str, query: str, limit: int = 10,
+                     min_score: float = None) -> list:
     """Return semantically similar chunks using Atlas Vector Search.
 
     Provider is selected by MEMORY_MAP_EMBED_PROVIDER:
       "openai" → client-side OpenAI embeddings + history_vector_index (queryVector)
       "atlas"  → Atlas autoEmbed (Voyage-4) + history_autoembed_index (queryText)
       ""       → returns [] so suggest_history falls back to tag matching
+
+    Returns at most `limit` chunks where Atlas vectorSearchScore >= min_score.
+    Empty/very short queries return [] immediately.
     """
+    if not query or len(query.strip()) < MIN_QUERY_CHARS:
+        return []
+    if min_score is None:
+        min_score = MIN_VECTOR_SCORE
+
     if EMBED_PROVIDER == "openai":
         embedding = _embed(query)
         if embedding is None:
@@ -263,7 +303,7 @@ def search_by_vector(project: str, query: str, limit: int = 5) -> list:
         vector_search = {
             "index": ATLAS_AUTOEMBED_INDEX,
             "path": "dialogue",
-            "queryText": query,
+            "query": query,
             "numCandidates": limit * 10,
             "limit": limit,
             "filter": {"project": {"$eq": project}},
@@ -277,15 +317,70 @@ def search_by_vector(project: str, query: str, limit: int = 5) -> list:
         {"$vectorSearch": vector_search},
         {"$project": {**exclude_fields, "score": {"$meta": "vectorSearchScore"}}},
     ]
-    docs = list(_get_collection().aggregate(pipeline))
-    return [{
-        "id": str(doc["_id"]),
-        "timestamp": doc.get("timestamp", ""),
-        "tags": doc.get("tags", []),
-        "preview": doc.get("preview", ""),
-        "stats": doc.get("stats", {}),
-        "score": doc.get("score", 0.0),
-    } for doc in docs]
+    try:
+        docs = list(_get_collection().aggregate(pipeline))
+    except Exception as exc:
+        logger.error("memory_map: vector search failed (%s) — falling back", exc)
+        return []
+
+    results = []
+    skipped = 0
+    for doc in docs:
+        score = doc.get("score", 0.0)
+        if score < min_score:
+            skipped += 1
+            continue
+        results.append({
+            "id": str(doc["_id"]),
+            "timestamp": doc.get("timestamp", ""),
+            "tags": doc.get("tags", []),
+            "preview": doc.get("preview", ""),
+            "stats": doc.get("stats", {}),
+            "score": score,
+        })
+
+    if skipped:
+        logger.info("memory_map: vector search returned %d chunks, %d below min_score=%.2f",
+                    len(results), skipped, min_score)
+    return results
+
+
+def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
+    """Embed and update chunks that lack an `embedding` field.
+
+    Useful after enabling vector search to make pre-existing chunks searchable.
+    If project is None, backfills across all projects. Returns counts.
+    Only meaningful when EMBED_PROVIDER=openai; atlas autoEmbed handles its own.
+    """
+    if EMBED_PROVIDER != "openai":
+        return {"backfilled": 0, "skipped": 0, "reason": f"backfill only applies to openai provider, current={EMBED_PROVIDER!r}"}
+
+    col = _get_collection()
+    query = {"embedding": {"$exists": False}}
+    if project:
+        query["project"] = project
+
+    cursor = col.find(query, {"_id": 1, "dialogue": 1}).limit(batch_size)
+    docs = list(cursor)
+    if not docs:
+        return {"backfilled": 0, "skipped": 0, "remaining": 0}
+
+    backfilled = 0
+    failed = 0
+    for doc in docs:
+        dialogue = doc.get("dialogue", "") or ""
+        if not dialogue.strip():
+            failed += 1
+            continue
+        embedding = _embed(dialogue)
+        if embedding is None:
+            failed += 1
+            continue
+        col.update_one({"_id": doc["_id"]}, {"$set": {"embedding": embedding}})
+        backfilled += 1
+
+    remaining = col.count_documents(query)
+    return {"backfilled": backfilled, "failed": failed, "remaining": remaining}
 
 
 # ---------------------------------------------------------------------------

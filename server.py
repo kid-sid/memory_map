@@ -508,67 +508,110 @@ def get_history_chunks(project_path: str, ids: str) -> str:
 
 
 @mcp.tool()
+def backfill_history_embeddings(project_path: str = "", batch_size: int = 20) -> str:
+    """Generate embeddings for chunks that don't have one yet.
+
+    Useful after enabling vector search for the first time so existing chunks
+    become searchable. Pass project_path="" to backfill across all projects.
+    Processes batch_size chunks per call — run repeatedly until 'remaining' = 0.
+
+    Only meaningful when MEMORY_MAP_EMBED_PROVIDER=openai. Atlas autoEmbed
+    handles its own embeddings automatically.
+    """
+    try:
+        result = history_store.backfill_embeddings(
+            project=project_path or None,
+            batch_size=batch_size,
+        )
+        if "reason" in result:
+            return f"skipped: {result['reason']}"
+        return (
+            f"backfilled: {result['backfilled']}, "
+            f"failed: {result.get('failed', 0)}, "
+            f"remaining: {result['remaining']}"
+        )
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
 def suggest_history(project_path: str, user_message: str, token_budget: int = 2000) -> str:
     """Retrieve the most relevant history chunks for the current task.
 
-    Builds candidates from two pools — tag-matched chunks (any age) and the
-    10 most recent chunks — then scores by tag-keyword match, recency decay,
-    and preview word overlap. Returns full dialogue for the best-fit chunks
-    within token_budget.
+    Selection logic (in priority order):
+      1. Anchor — the most recent chunk is always included for session continuity.
+      2. Vector matches — semantically similar chunks via Atlas Vector Search,
+         filtered by min_score, ranked by similarity (high → low).
+      3. Recent fill — most recent chunks not already selected, used to fill
+         remaining token budget after vector matches.
+
+    Falls back to keyword tag matching when EMBED_PROVIDER is unset or vector
+    search returns nothing.
 
     Call at session start with the user's first message instead of manually
     calling load_history + get_history_chunks.
     """
     try:
-        # Anchor: always include the most recent chunk for session continuity
         recent_candidates = history_store.load_index(project_path, last_n=10)
-        anchor_id = recent_candidates[0]["id"] if recent_candidates else None
-        selected = [anchor_id] if anchor_id else []
-        used = recent_candidates[0]["stats"].get("tokens", 0) if recent_candidates else 0
+        if not recent_candidates:
+            return "no history yet"
 
-        # Pool 1 — vector search (semantic similarity to user message)
-        vector_candidates = history_store.search_by_vector(project_path, user_message, limit=20)
+        # Anchor: most recent chunk, always included for continuity.
+        anchor = recent_candidates[0]
+        selected_ids = [anchor["id"]]
+        score_map = {anchor["id"]: ("anchor", 1.0)}
+        used = anchor["stats"].get("tokens", 0)
 
-        # Pool 2 — tag matching fallback (used when no OPENAI_API_KEY or no embeddings yet)
+        # Pool 1 — vector search (semantic). Returns [] for short queries or no provider.
+        vector_candidates = history_store.search_by_vector(project_path, user_message, limit=10)
+
+        # Pool 2 — tag matching fallback
         if not vector_candidates:
             msg_tags = history_store.extract_tags(user_message)
-            tag_candidates = history_store.query_by_tags(project_path, msg_tags, limit=30)
-            scored = history_store.score_chunks(tag_candidates + recent_candidates, user_message)
-            candidates = [entry for _, entry in scored]
+            tag_candidates = history_store.query_by_tags(project_path, msg_tags, limit=20)
+            scored = history_store.score_chunks(tag_candidates, user_message)
+            ranked = [(entry, sc, "tag") for sc, entry in scored if sc > 0]
         else:
-            # Merge vector results with recency pool, dedup by id
-            seen: set = set(selected)
-            candidates = []
-            for entry in vector_candidates + recent_candidates:
-                if entry["id"] not in seen:
-                    seen.add(entry["id"])
-                    candidates.append(entry)
+            ranked = [(entry, entry.get("score", 0.0), "vector") for entry in vector_candidates]
 
-        if not candidates and not selected:
-            return "no history yet"
-
-        # Fill token budget from candidates
-        for entry in candidates:
-            if entry["id"] == anchor_id:
+        # Add ranked candidates by score (high first) within budget.
+        for entry, score, source in ranked:
+            if entry["id"] in score_map:
                 continue
             t = entry["stats"].get("tokens", 0)
-            if used + t <= token_budget:
-                selected.append(entry["id"])
-                used += t
+            if used + t > token_budget:
+                continue
+            selected_ids.append(entry["id"])
+            score_map[entry["id"]] = (source, score)
+            used += t
 
-        if not selected:
-            return "no history yet"
+        # Fill remaining budget with recent chunks not yet selected.
+        for entry in recent_candidates:
+            if entry["id"] in score_map:
+                continue
+            t = entry["stats"].get("tokens", 0)
+            if used + t > token_budget:
+                continue
+            selected_ids.append(entry["id"])
+            score_map[entry["id"]] = ("recent", 0.0)
+            used += t
 
-        chunks, total_tokens = history_store.get_chunks(project_path, selected)
+        chunks, total_tokens = history_store.get_chunks(project_path, selected_ids)
         if not chunks:
             return "no history yet"
 
+        # Present chronologically (oldest first) so the narrative flows naturally.
+        chunks.sort(key=lambda c: c.get("timestamp", ""))
+
         lines = [
-            f"=== Relevant History ({len(chunks)} chunks, {total_tokens} tokens) ===", ""
+            f"=== Relevant History ({len(chunks)} chunks, {total_tokens} tokens) ===",
+            "",
         ]
         for chunk in chunks:
+            source, score = score_map.get(chunk["id"], ("?", 0.0))
             tag_str = ",".join(chunk.get("tags", [])) or "untagged"
-            lines.append(f"[{chunk['id']}] {chunk['timestamp']} tags:[{tag_str}]")
+            score_str = f" score={score:.2f}" if source in ("vector", "tag") else ""
+            lines.append(f"[{chunk['id']}] {chunk['timestamp']} src={source}{score_str} tags:[{tag_str}]")
             lines.append(chunk.get("dialogue", ""))
             lines.append("")
         return "\n".join(lines)
