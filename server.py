@@ -658,13 +658,33 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         return f"error: {e}"
 
 
+MAX_PROJECT_SCAN_DEPTH = 5
+
+
+def _iter_project_dirs(root: pathlib.Path, max_depth: int, _current: int = 1):
+    """Yield directories that contain MEMORY_FILE, up to max_depth levels deep."""
+    try:
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            if (entry / MEMORY_FILE).exists():
+                yield entry
+            if _current < max_depth:
+                yield from _iter_project_dirs(entry, max_depth, _current + 1)
+    except PermissionError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Tools: Multi-project integration
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_projects(base_path: str) -> str:
-    """List all projects under base_path that have saved memory, with key counts and last save time."""
+def list_projects(base_path: str, max_depth: int = 1) -> str:
+    """List all projects under base_path that have saved memory, with key counts and last save time.
+
+    max_depth: how many directory levels to scan (1 = direct children only, max 5).
+    """
     try:
         root = _validate_project_path(base_path)
     except ValueError as e:
@@ -672,25 +692,18 @@ def list_projects(base_path: str) -> str:
     if not root.exists() or not root.is_dir():
         return json.dumps({"error": f"'{base_path}' is not a valid directory"})
 
+    max_depth = max(1, min(max_depth, MAX_PROJECT_SCAN_DEPTH))
     projects = []
-    try:
-        for entry in sorted(root.iterdir()):
-            if not entry.is_dir():
-                continue
-            mem_file = entry / MEMORY_FILE
-            if not mem_file.exists():
-                continue
-            data = _load_json_safe(mem_file, {})
-            keys = [k for k in data if not k.startswith("_")]
-            last_save = history_store.get_latest_save(str(entry))
-            projects.append({
-                "path": str(entry),
-                "name": entry.name,
-                "key_count": len(keys),
-                "last_save": last_save,
-            })
-    except PermissionError as e:
-        return json.dumps({"error": str(e)})
+    for entry in _iter_project_dirs(root, max_depth):
+        data = _load_json_safe(entry / MEMORY_FILE, {})
+        keys = [k for k in data if not k.startswith("_")]
+        last_save = history_store.get_latest_save(str(entry))
+        projects.append({
+            "path": str(entry),
+            "name": entry.name,
+            "key_count": len(keys),
+            "last_save": last_save,
+        })
 
     return json.dumps(projects)
 
@@ -727,8 +740,11 @@ def get_project_summary(project_path: str) -> str:
 
 
 @mcp.tool()
-def load_cross_project_memory(base_path: str, query_keys: str = "") -> str:
-    """Load memory from all projects under base_path, optionally filtered by comma-separated keys."""
+def load_cross_project_memory(base_path: str, query_keys: str = "", max_depth: int = 1) -> str:
+    """Load memory from all projects under base_path, optionally filtered by comma-separated keys.
+
+    max_depth: how many directory levels to scan (1 = direct children only, max 5).
+    """
     try:
         root = _validate_project_path(base_path)
     except ValueError as e:
@@ -736,34 +752,30 @@ def load_cross_project_memory(base_path: str, query_keys: str = "") -> str:
     if not root.exists() or not root.is_dir():
         return f"error: '{base_path}' is not a valid directory"
 
+    max_depth = max(1, min(max_depth, MAX_PROJECT_SCAN_DEPTH))
     filter_keys = {k.strip() for k in query_keys.split(",") if k.strip()} if query_keys else set()
 
     sections = []
-    try:
-        for entry in sorted(root.iterdir()):
-            if not entry.is_dir():
-                continue
-            mem_file = entry / MEMORY_FILE
-            if not mem_file.exists():
-                continue
-            data = _load_json_safe(mem_file, {})
-            level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
-            entries = {k: v for k, v in data.items() if not k.startswith("_")}
-            if filter_keys:
-                entries = {k: v for k, v in entries.items() if k in filter_keys}
-            if not entries:
-                continue
-            compressed = _compress_memory(entries, level)
-            sections.append(f"=== {entry.name} ===\n{compressed}")
-    except PermissionError as e:
-        return f"error: {e}"
+    for entry in _iter_project_dirs(root, max_depth):
+        data = _load_json_safe(entry / MEMORY_FILE, {})
+        level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
+        entries = {k: v for k, v in data.items() if not k.startswith("_")}
+        if filter_keys:
+            entries = {k: v for k, v in entries.items() if k in filter_keys}
+        if not entries:
+            continue
+        compressed = _compress_memory(entries, level)
+        sections.append(f"=== {entry.name} ===\n{compressed}")
 
     return "\n\n".join(sections) if sections else "no projects with memory found"
 
 
 @mcp.tool()
-def search_across_projects(base_path: str, keyword: str) -> str:
-    """Search memory values across all projects under base_path for a keyword (case-insensitive)."""
+def search_across_projects(base_path: str, keyword: str, max_depth: int = 1) -> str:
+    """Search memory values across all projects under base_path for a keyword (case-insensitive).
+
+    max_depth: how many directory levels to scan (1 = direct children only, max 5).
+    """
     try:
         root = _validate_project_path(base_path)
     except ValueError as e:
@@ -773,31 +785,24 @@ def search_across_projects(base_path: str, keyword: str) -> str:
     if not keyword.strip():
         return "error: keyword cannot be empty"
 
+    max_depth = max(1, min(max_depth, MAX_PROJECT_SCAN_DEPTH))
     kw = keyword.lower()
     matches = []
 
-    try:
-        for entry in sorted(root.iterdir()):
-            if not entry.is_dir():
+    for entry in _iter_project_dirs(root, max_depth):
+        data = _load_json_safe(entry / MEMORY_FILE, {})
+        for k, v in data.items():
+            if k.startswith("_"):
                 continue
-            mem_file = entry / MEMORY_FILE
-            if not mem_file.exists():
-                continue
-            data = _load_json_safe(mem_file, {})
-            for k, v in data.items():
-                if k.startswith("_"):
-                    continue
-                text = str(v)
-                if kw in text.lower():
-                    pos = text.lower().find(kw)
-                    start = max(0, pos - 30)
-                    end = min(len(text), pos + 70)
-                    prefix = "..." if start > 0 else ""
-                    suffix = "..." if end < len(text) else ""
-                    window = prefix + text[start:end] + suffix
-                    matches.append(f"{entry.name} / {k}: \"{window}\"")
-    except PermissionError as e:
-        return f"error: {e}"
+            text = str(v)
+            if kw in text.lower():
+                pos = text.lower().find(kw)
+                start = max(0, pos - 30)
+                end = min(len(text), pos + 70)
+                prefix = "..." if start > 0 else ""
+                suffix = "..." if end < len(text) else ""
+                window = prefix + text[start:end] + suffix
+                matches.append(f"{entry.name} / {k}: \"{window}\"")
 
     return "\n".join(matches) if matches else f"no matches for '{keyword}'"
 
