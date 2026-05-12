@@ -568,15 +568,16 @@ def backfill_history_embeddings(project_path: str = "", batch_size: int = 20) ->
 def suggest_history(project_path: str, user_message: str, token_budget: int = 2000) -> str:
     """Retrieve the most relevant history chunks for the current task.
 
-    Selection logic (in priority order):
-      1. Anchor — the most recent chunk is always included for session continuity.
-      2. Vector matches — semantically similar chunks via Atlas Vector Search,
-         filtered by min_score, ranked by similarity (high → low).
-      3. Recent fill — most recent chunks not already selected, used to fill
-         remaining token budget after vector matches.
+    Selection logic:
+      1. Vector search (if EMBED_PROVIDER configured) + BM25/tag scoring are run
+         in parallel and merged with Reciprocal Rank Fusion (RRF, k=60).  Chunks
+         appearing in both lists outrank chunks in only one.
+      2. Anchor (most recent chunk) is guaranteed to be included for session
+         continuity; it is BM25-scored and ranked like any other candidate.
+      3. Remaining token budget is filled with the most recent unselected chunks.
 
-    Falls back to keyword tag matching when EMBED_PROVIDER is unset or vector
-    search returns nothing.
+    When no EMBED_PROVIDER is configured, only BM25+tag scoring is used and RRF
+    is applied over the single list (preserving BM25 order).
 
     Call at session start with the user's first message instead of manually
     calling load_history + get_history_chunks.
@@ -595,21 +596,23 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         score_map: dict = {}
         used = 0
 
-        # Pool 1 — vector search (semantic). Returns [] for short queries or no provider.
+        # Pool 1 — vector search (semantic). Returns [] when no provider is configured.
         vector_candidates = history_store.search_by_vector(project_path, user_message, limit=10)
+        vector_ranked = [(e, e.get("score", 0.0), "vector") for e in vector_candidates]
 
-        # Pool 2 — BM25 + tag scoring over full history index
-        if not vector_candidates:
-            # Score over all recent history (last 50) so BM25 IDF is computed
-            # over a meaningful corpus, not just the tag-matched subset.
-            all_candidates = history_store.load_index(project_path, last_n=50)
-            scored = history_store.score_chunks(all_candidates, user_message)
-            ranked = [(entry, sc, "bm25") for sc, entry in scored if sc > 0]
-        else:
-            ranked = [(entry, entry.get("score", 0.0), "vector") for entry in vector_candidates]
+        # Pool 2 — BM25 + tag scoring over full history (always runs).
+        all_candidates = history_store.load_index(project_path, last_n=50)
+        scored = history_store.score_chunks(all_candidates, user_message)
+        bm25_ranked = [(entry, sc, "bm25") for sc, entry in scored if sc > 0]
 
-        # Add ranked candidates by score (high first) within budget.
-        # The anchor is labelled distinctly but ranked by its actual BM25/vector score.
+        # Merge both pools with Reciprocal Rank Fusion.  A chunk in both lists
+        # gets a contribution from each rank, so it outranks a chunk in only one.
+        active_lists = [lst for lst in [vector_ranked, bm25_ranked] if lst]
+        merged = history_store.rrf_merge(active_lists) if active_lists else []
+        ranked = [(entry, rrf_score, source) for rrf_score, entry, source in merged]
+
+        # Add ranked candidates (high score first) within budget.
+        # The anchor entry is relabelled 'anchor' for output transparency.
         for entry, score, source in ranked:
             t = entry["stats"].get("tokens", 0)
             if used + t > token_budget:

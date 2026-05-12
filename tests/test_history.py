@@ -292,3 +292,53 @@ def test_score_no_tags_chunk_ranked_by_recency_and_preview():
     untagged_new = _make_entry("2", [], "performance benchmark results", age_days=0)
     scored = history_store.score_chunks([tagged_old, untagged_new], "fix the performance issue")
     assert scored[0][1]["id"] == "2"
+
+
+# ---------------------------------------------------------------------------
+# rrf_merge unit tests
+# ---------------------------------------------------------------------------
+
+def _e(eid: str) -> dict:
+    return {"id": eid, "preview": "", "bm25_text": ""}
+
+
+def test_rrf_merge_dual_list_beats_single():
+    """A chunk appearing in both ranked lists must rank above one in only one list."""
+    dual = _e("dual")
+    single = _e("single")
+    list1 = [(dual, 0.9, "vector"), (single, 0.8, "vector")]
+    list2 = [(dual, 0.7, "bm25")]
+    merged = history_store.rrf_merge([list1, list2])
+    ids = [e["id"] for _, e, _ in merged]
+    assert ids[0] == "dual", "chunk in both lists should rank first"
+
+
+def test_rrf_merge_single_list_preserves_order():
+    """RRF over a single list preserves the original ranking order."""
+    e1, e2, e3 = _e("1"), _e("2"), _e("3")
+    ranked = [(e1, 0.9, "bm25"), (e2, 0.5, "bm25"), (e3, 0.1, "bm25")]
+    merged = history_store.rrf_merge([ranked])
+    ids = [e["id"] for _, e, _ in merged]
+    assert ids == ["1", "2", "3"]
+
+
+def test_rrf_merge_source_label_combined():
+    """A chunk in both lists gets a combined source label containing both names."""
+    e = _e("x")
+    merged = history_store.rrf_merge([[(e, 0.9, "vector")], [(e, 0.5, "bm25")]])
+    _, _, source = merged[0]
+    assert "bm25" in source and "vector" in source
+
+
+def test_rrf_merge_empty_lists_returns_empty():
+    assert history_store.rrf_merge([]) == []
+
+
+def test_rrf_merge_k_affects_scores_not_order():
+    """Different k values change the magnitude of RRF scores but not their relative order."""
+    e1, e2 = _e("1"), _e("2")
+    ranked = [(e1, 0.9, "bm25"), (e2, 0.5, "bm25")]
+    for k in (1, 60, 100):
+        merged = history_store.rrf_merge([ranked], k=k)
+        ids = [e["id"] for _, e, _ in merged]
+        assert ids == ["1", "2"], f"order changed with k={k}"

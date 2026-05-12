@@ -519,3 +519,35 @@ def score_chunks(index: list, user_message: str) -> list:
         scored.append((combined, entry))
 
     return sorted(scored, key=lambda x: -x[0])
+
+
+def rrf_merge(ranked_lists: list, k: int = 60) -> list:
+    """Reciprocal Rank Fusion over multiple ranked entry lists.
+
+    Each input list is a sequence of (entry, score, source) tuples, best-first.
+    RRF score for chunk i = sum(1 / (k + rank_i)) across all lists where it
+    appears (ranks are 1-indexed).  k=60 is the standard constant.
+
+    A chunk appearing in both a vector list and a BM25 list receives contributions
+    from both and will outrank a chunk that appears in only one — which is the
+    hybrid retrieval guarantee.
+
+    Returns a single list of (rrf_score, entry, source_label) sorted desc.
+    source_label joins source names from every contributing list, e.g. "bm25+vector".
+    """
+    rrf_scores: dict = {}
+    entries: dict = {}
+    sources: dict = {}
+
+    for ranked in ranked_lists:
+        for rank, (entry, _score, source) in enumerate(ranked, start=1):
+            eid = entry["id"]
+            rrf_scores[eid] = rrf_scores.get(eid, 0.0) + 1.0 / (k + rank)
+            entries[eid] = entry
+            sources.setdefault(eid, set()).add(source)
+
+    result = []
+    for eid, rrf_score in sorted(rrf_scores.items(), key=lambda x: -x[1]):
+        source_label = "+".join(sorted(sources[eid]))
+        result.append((rrf_score, entries[eid], source_label))
+    return result
