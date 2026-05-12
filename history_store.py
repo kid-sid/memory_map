@@ -415,6 +415,39 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
     return {"backfilled": backfilled, "failed": failed, "remaining": remaining}
 
 
+def backfill_bm25_text(project: str = None, batch_size: int = 100) -> dict:
+    """Write bm25_text (first 500 chars of dialogue) to chunks that lack the field.
+
+    bm25_text was added in a later release; existing chunks only have the 100-char
+    preview and score with 5x less signal.  Run this once after upgrading to bring
+    all chunks up to the current schema.  If project is None, backfills globally.
+    """
+    col = _get_collection()
+    if col is None:
+        return {"backfilled": 0, "remaining": 0, "reason": "MongoDB not configured"}
+
+    query: dict = {"bm25_text": {"$exists": False}}
+    if project:
+        query["project"] = project
+
+    cursor = col.find(query, {"_id": 1, "dialogue": 1}).limit(batch_size)
+    docs = list(cursor)
+    if not docs:
+        return {"backfilled": 0, "remaining": 0}
+
+    ops = []
+    from pymongo import UpdateOne
+    for doc in docs:
+        bm25_text = (doc.get("dialogue") or "")[:500]
+        ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"bm25_text": bm25_text}}))
+
+    if ops:
+        col.bulk_write(ops, ordered=False)
+
+    remaining = col.count_documents(query)
+    return {"backfilled": len(ops), "remaining": remaining}
+
+
 # ---------------------------------------------------------------------------
 # Relevance scoring
 # ---------------------------------------------------------------------------

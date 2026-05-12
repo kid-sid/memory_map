@@ -565,6 +565,26 @@ def backfill_history_embeddings(project_path: str = "", batch_size: int = 20) ->
 
 
 @mcp.tool()
+def backfill_bm25_text(project_path: str = "", batch_size: int = 100) -> str:
+    """Write bm25_text (500-char BM25 corpus field) to chunks that lack it.
+
+    Chunks saved before this field was introduced only have the 100-char preview
+    and score with 5x less signal in BM25 retrieval. Run once after upgrading;
+    repeat until 'remaining' = 0. Pass project_path="" to backfill all projects.
+    """
+    try:
+        result = history_store.backfill_bm25_text(
+            project=project_path or None,
+            batch_size=batch_size,
+        )
+        if "reason" in result:
+            return f"skipped: {result['reason']}"
+        return f"backfilled: {result['backfilled']}, remaining: {result['remaining']}"
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
 def suggest_history(project_path: str, user_message: str, token_budget: int = 2000) -> str:
     """Retrieve the most relevant history chunks for the current task.
 
