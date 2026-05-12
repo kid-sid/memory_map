@@ -176,8 +176,14 @@ def extract_tags(dialogue: str) -> list:
 
 
 def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
-               group_id: str = None, part: int = None, total_parts: int = None) -> str:
-    """Persist a history chunk to MongoDB. Returns the inserted ObjectId as string."""
+               group_id: str = None, part: int = None, total_parts: int = None,
+               embed: bool = True) -> str:
+    """Persist a history chunk to MongoDB. Returns the inserted ObjectId as string.
+
+    embed=False skips the client-side OpenAI embedding call (useful for hooks
+    that must return quickly; run backfill_history_embeddings later to catch up).
+    Atlas autoEmbed is always server-side and unaffected by this flag.
+    """
     col = _get_collection()
     if col is None:
         raise RuntimeError("memory_map: MEMORY_MAP_MONGO_URI is not set — cannot save history")
@@ -193,7 +199,7 @@ def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
         "tags": tags,
         "stats": stats,
     }
-    if EMBED_PROVIDER == "openai":
+    if embed and EMBED_PROVIDER == "openai":
         embedding = _embed(dialogue)
         if embedding is not None:
             doc["embedding"] = embedding

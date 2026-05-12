@@ -241,6 +241,7 @@ def main():
                 group_id=gid,
                 part=(idx if n > 1 else None),
                 total_parts=(n if n > 1 else None),
+                embed=False,  # hooks must return quickly; embeddings backfilled separately
             )
             total_tokens += history_store.compute_stats(chunk)["tokens"]
 
