@@ -18,8 +18,6 @@ mcp = FastMCP("file-structure")
 DEFAULT_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "dist", ".next", ".mypy_cache", ".pytest_cache"}
 
 MEMORY_FILE = ".mcp_memory.json"
-HISTORY_FILE = ".mcp_history.json"
-MAX_HISTORY_CHUNKS = 20
 COMPRESSION_KEY = "_compression"
 DEFAULT_COMPRESSION = 1
 KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,100}$')
@@ -325,10 +323,6 @@ def get_git_history(path: str, count: int = 5) -> str:
 
 def _memory_path(project_path: str) -> pathlib.Path:
     return _validate_project_path(project_path) / MEMORY_FILE
-
-
-def _history_path(project_path: str) -> pathlib.Path:
-    return _validate_project_path(project_path) / HISTORY_FILE
 
 
 def _read_memory(project_path: str) -> dict:
