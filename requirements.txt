@@ -1,5 +1,6 @@
 fastmcp
 httpx
+pathspec
 portalocker
 pymongo
 python-dotenv

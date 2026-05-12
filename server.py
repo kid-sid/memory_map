@@ -3,11 +3,12 @@ import pathlib
 import httpx
 import json
 import os
-import fnmatch
 import subprocess
 import re
 import datetime
 import tempfile
+
+import pathspec
 
 import portalocker
 import history_store
@@ -142,35 +143,31 @@ def _locked_write(path: pathlib.Path, data: dict) -> None:
 # Tool: get_local_structure
 # ---------------------------------------------------------------------------
 
-def load_gitignore_patterns(root_path: pathlib.Path) -> list[str]:
+def load_gitignore_spec(root_path: pathlib.Path):
+    """Return a pathspec.PathSpec for the root .gitignore, or None if absent."""
     gitignore_path = root_path / ".gitignore"
-    patterns = []
-    if gitignore_path.exists():
-        with open(gitignore_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    if line.endswith("/"):
-                        patterns.append(line[:-1])
-                        patterns.append(line + "*")
-                    else:
-                        patterns.append(line)
-    return patterns
+    if not gitignore_path.exists():
+        return None
+    try:
+        lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+        return pathspec.PathSpec.from_lines("gitignore", lines)
+    except OSError:
+        return None
 
 
-def is_ignored(entry_name: str, patterns: list[str]) -> bool:
-    if entry_name in DEFAULT_IGNORE:
+def is_ignored(entry: pathlib.Path, root: pathlib.Path, spec) -> bool:
+    if entry.name in DEFAULT_IGNORE:
         return True
-    for pattern in patterns:
-        if fnmatch.fnmatch(entry_name, pattern):
-            return True
-    return False
+    if spec is None:
+        return False
+    rel = entry.relative_to(root).as_posix()
+    return spec.match_file(rel) or (entry.is_dir() and spec.match_file(rel + "/"))
 
 
-def build_local_tree(dir_path: pathlib.Path, max_depth: int, patterns: list[str], current_depth: int = 0) -> "dict | list":
+def build_local_tree(dir_path: pathlib.Path, max_depth: int, root: pathlib.Path, spec, current_depth: int = 0) -> "dict | list":
     try:
         entries = sorted(dir_path.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-        entries = [e for e in entries if not is_ignored(e.name, patterns)]
+        entries = [e for e in entries if not is_ignored(e, root, spec)]
     except PermissionError:
         return []
 
@@ -184,7 +181,7 @@ def build_local_tree(dir_path: pathlib.Path, max_depth: int, patterns: list[str]
         if entry.is_file():
             files.append(entry.name)
         elif entry.is_dir():
-            subdirs[entry.name] = build_local_tree(entry, max_depth, patterns, current_depth + 1)
+            subdirs[entry.name] = build_local_tree(entry, max_depth, root, spec, current_depth + 1)
 
     if not subdirs:
         return files
@@ -208,8 +205,8 @@ def get_local_structure(path: str, max_depth: int = 5) -> str:
     if not root.is_dir():
         return json.dumps({"error": f"'{path}' is not a directory"})
 
-    patterns = load_gitignore_patterns(root)
-    tree = {root.name: build_local_tree(root, max_depth, patterns)}
+    spec = load_gitignore_spec(root)
+    tree = {root.name: build_local_tree(root, max_depth, root, spec)}
     return json.dumps(tree)
 
 
