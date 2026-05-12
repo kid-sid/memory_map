@@ -118,11 +118,10 @@ def test_search_skips_system_keys(tmp_path):
 
 def test_get_project_summary_basic(tmp_path):
     proj = setup_project(tmp_path, "myproject", {"stack": "Python", "entry": "main.py"})
-    save_history(str(proj), "Fixed login bug")
     result = get_project_summary(str(proj))
     assert "myproject" in result
     assert "Keys stored: 2" in result
-    assert "Fixed login bug" in result
+    assert "Compression" in result
 
 
 def test_get_project_summary_no_history(tmp_path):

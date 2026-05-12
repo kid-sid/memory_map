@@ -131,10 +131,8 @@ def _get_collection():
 
     uri = os.environ.get("MEMORY_MAP_MONGO_URI", "")
     if not uri:
-        raise RuntimeError(
-            "memory_map: MEMORY_MAP_MONGO_URI is not set. "
-            "Add it to your .env file to connect to MongoDB Atlas."
-        )
+        logger.debug("memory_map: MEMORY_MAP_MONGO_URI not set — MongoDB history unavailable")
+        return None
 
     try:
         from pymongo import MongoClient
@@ -180,6 +178,9 @@ def extract_tags(dialogue: str) -> list:
 def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
                group_id: str = None, part: int = None, total_parts: int = None) -> str:
     """Persist a history chunk to MongoDB. Returns the inserted ObjectId as string."""
+    col = _get_collection()
+    if col is None:
+        raise RuntimeError("memory_map: MEMORY_MAP_MONGO_URI is not set — cannot save history")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     stats = compute_stats(dialogue)
     doc = {
@@ -200,13 +201,16 @@ def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
         doc["group_id"] = group_id
         doc["part"] = part
         doc["total_parts"] = total_parts
-    result = _get_collection().insert_one(doc)
+    result = col.insert_one(doc)
     return str(result.inserted_id)
 
 
 def load_index(project: str, last_n: int = 20) -> list:
     """Return tag index records (no full dialogue), newest first."""
-    cursor = _get_collection().find(
+    col = _get_collection()
+    if col is None:
+        return []
+    cursor = col.find(
         {"project": project},
         {"dialogue": 0},
     ).sort("timestamp", -1).limit(last_n)
@@ -223,7 +227,10 @@ def query_by_tags(project: str, tags: list, limit: int = 30) -> list:
     """Return index entries for chunks matching any of the given tags, newest first."""
     if not tags:
         return []
-    cursor = _get_collection().find(
+    col = _get_collection()
+    if col is None:
+        return []
+    cursor = col.find(
         {"project": project, "tags": {"$in": tags}},
         {"dialogue": 0},
     ).sort("timestamp", -1).limit(limit)
@@ -238,6 +245,9 @@ def query_by_tags(project: str, tags: list, limit: int = 30) -> list:
 
 def get_chunks(project: str, ids: list) -> tuple:
     """Fetch full chunks by ID list. Returns (chunks, total_tokens)."""
+    col = _get_collection()
+    if col is None:
+        return [], 0
     from bson import ObjectId
     oids = []
     for id_str in ids:
@@ -245,7 +255,7 @@ def get_chunks(project: str, ids: list) -> tuple:
             oids.append(ObjectId(id_str))
         except Exception:
             pass
-    docs = list(_get_collection().find({"_id": {"$in": oids}}).sort("timestamp", -1))
+    docs = list(col.find({"_id": {"$in": oids}}).sort("timestamp", -1))
     chunks = [{
         "id": str(doc["_id"]),
         "timestamp": doc.get("timestamp", ""),
@@ -260,7 +270,10 @@ def get_chunks(project: str, ids: list) -> tuple:
 
 def get_latest_save(project: str) -> str:
     """Return ISO timestamp of the most recent chunk, or ''."""
-    doc = _get_collection().find_one(
+    col = _get_collection()
+    if col is None:
+        return ""
+    doc = col.find_one(
         {"project": project},
         {"timestamp": 1},
         sort=[("timestamp", -1)],
@@ -317,8 +330,11 @@ def search_by_vector(project: str, query: str, limit: int = 10,
         {"$vectorSearch": vector_search},
         {"$project": {**exclude_fields, "score": {"$meta": "vectorSearchScore"}}},
     ]
+    col = _get_collection()
+    if col is None:
+        return []
     try:
-        docs = list(_get_collection().aggregate(pipeline))
+        docs = list(col.aggregate(pipeline))
     except Exception as exc:
         logger.error("memory_map: vector search failed (%s) — falling back", exc)
         return []
@@ -356,6 +372,8 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
         return {"backfilled": 0, "skipped": 0, "reason": f"backfill only applies to openai provider, current={EMBED_PROVIDER!r}"}
 
     col = _get_collection()
+    if col is None:
+        return {"backfilled": 0, "skipped": 0, "reason": "MongoDB not configured"}
     query = {"embedding": {"$exists": False}}
     if project:
         query["project"] = project
