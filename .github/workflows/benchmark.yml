@@ -1,0 +1,60 @@
+name: Retrieval Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      k:
+        description: Recall/Precision/nDCG cutoff
+        default: "5"
+        required: false
+      index_wait:
+        description: Seconds to wait for Atlas vector index sync (set >0 only with Atlas URI)
+        default: "0"
+        required: false
+
+jobs:
+  benchmark:
+    name: Retrieval benchmark
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MEMORY_MAP_MONGO_URI: ${{ secrets.MEMORY_MAP_MONGO_URI || 'mongodb://localhost:27017' }}
+      MEMORY_MAP_EMBED_PROVIDER: ${{ secrets.MEMORY_MAP_EMBED_PROVIDER || '' }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run benchmark
+        run: |
+          python benchmarks/bench_retrieval.py \
+            --k ${{ inputs.k || 5 }} \
+            --index-wait ${{ inputs.index_wait || 0 }} \
+            --verbose
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmarks/results/
+          retention-days: 90
