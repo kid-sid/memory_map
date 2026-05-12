@@ -285,7 +285,10 @@ def get_git_history(path: str, count: int = 5) -> str:
 
     Timeout is controlled by MCP_GIT_TIMEOUT env var (default 10s).
     """
-    root = pathlib.Path(path)
+    try:
+        root = _validate_project_path(path)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     if not root.exists() or not root.is_dir():
         return json.dumps({"error": f"Invalid path: {path}"})
 
