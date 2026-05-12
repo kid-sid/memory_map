@@ -546,4 +546,12 @@ python -m pytest tests/ -v
 
 ---
 
-Built with [FastMCP](https://gofastmcp.com).
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=kid-sid/memory_map&type=Date)](https://star-history.com/#kid-sid/memory_map&Date)
+
+---
+
+Built with [FastMCP](https://gofastmcp.com) · [Code of Conduct](CODE_OF_CONDUCT.md)
