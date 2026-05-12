@@ -1,14 +1,13 @@
 """Tests for the redesigned history system (tag index + full-fetch pattern)."""
 
 import datetime
-import json
 import pytest
 import history_store
 from server import save_history, load_history, get_history_chunks
 
 
 # ---------------------------------------------------------------------------
-# history_store unit tests (JSON backend — no MEMORY_MAP_MONGO_URI set)
+# history_store unit tests (require MongoDB)
 # ---------------------------------------------------------------------------
 
 def test_compute_stats_chars_and_tokens():
@@ -17,27 +16,13 @@ def test_compute_stats_chars_and_tokens():
     assert stats["tokens"] == len("hello world") // 4
 
 
-def test_save_chunk_returns_id(tmp_path):
+def test_save_chunk_returns_id(tmp_path, requires_mongodb):
     chunk_id = history_store.save_chunk(str(tmp_path), "sess1", "user: hello\nassistant: hi", [])
     assert chunk_id is not None
     assert chunk_id != ""
 
 
-def test_json_file_schema(tmp_path, json_mode):
-    """Saved chunk has the new schema fields (verified via JSON file in JSON-only mode)."""
-    history_store.save_chunk(str(tmp_path), "sess1", "user: debug the auth\nassistant: done", ["auth"])
-    data = json.loads((tmp_path / ".mcp_history.json").read_text())
-    chunk = data["chunks"][0]
-    assert "dialogue" in chunk
-    assert "preview" in chunk
-    assert "tags" in chunk
-    assert "stats" in chunk
-    assert "timestamp" in chunk
-    assert chunk["stats"]["chars"] > 0
-    assert chunk["stats"]["tokens"] == chunk["stats"]["chars"] // 4
-
-
-def test_load_index_no_dialogue(tmp_path):
+def test_load_index_no_dialogue(tmp_path, requires_mongodb):
     """load_index returns preview, not the full dialogue field."""
     dialogue = "user: refactor the db layer\nassistant: sure"
     history_store.save_chunk(str(tmp_path), "s1", dialogue, ["refactor", "database"])
@@ -49,11 +34,10 @@ def test_load_index_no_dialogue(tmp_path):
     assert "tags" in entry
     assert "preview" in entry
     assert "stats" in entry
-    # Full dialogue must NOT appear in the index record
     assert "dialogue" not in entry
 
 
-def test_load_index_preview_truncated(tmp_path):
+def test_load_index_preview_truncated(tmp_path, requires_mongodb):
     long_dialogue = (
         "user: the deploy pipeline breaks on docker build after we restructured "
         "the repo — the COPY command still references the old requirements.txt path\n"
@@ -65,7 +49,7 @@ def test_load_index_preview_truncated(tmp_path):
     assert len(index[0]["preview"]) <= 100
 
 
-def test_get_chunks_returns_full_dialogue(tmp_path):
+def test_get_chunks_returns_full_dialogue(tmp_path, requires_mongodb):
     dialogue = "user: fix the bug\nassistant: fixed"
     chunk_id = history_store.save_chunk(str(tmp_path), "s1", dialogue, ["bug-fix"])
     chunks, total_tokens = history_store.get_chunks(str(tmp_path), [chunk_id])
@@ -74,7 +58,7 @@ def test_get_chunks_returns_full_dialogue(tmp_path):
     assert total_tokens == chunks[0]["stats"]["tokens"]
 
 
-def test_get_chunks_total_tokens_sum(tmp_path):
+def test_get_chunks_total_tokens_sum(tmp_path, requires_mongodb):
     id1 = history_store.save_chunk(str(tmp_path), "s", "a" * 40, [])
     id2 = history_store.save_chunk(str(tmp_path), "s", "b" * 80, [])
     chunks, total = history_store.get_chunks(str(tmp_path), [id1, id2])
@@ -82,41 +66,25 @@ def test_get_chunks_total_tokens_sum(tmp_path):
     assert total == expected
 
 
-def test_get_chunks_unknown_id_skipped(tmp_path):
+def test_get_chunks_unknown_id_skipped(tmp_path, requires_mongodb):
     history_store.save_chunk(str(tmp_path), "s", "some dialogue", [])
     chunks, total = history_store.get_chunks(str(tmp_path), ["9999"])
     assert chunks == []
     assert total == 0
 
 
-def test_rolling_window_json(tmp_path, json_mode):
-    """JSON fallback keeps at most MAX_JSON_CHUNKS chunks."""
-    for i in range(history_store.MAX_JSON_CHUNKS + 5):
-        history_store.save_chunk(str(tmp_path), "s", f"dialogue {i}", [])
-    data = json.loads((tmp_path / ".mcp_history.json").read_text())
-    assert len(data["chunks"]) == history_store.MAX_JSON_CHUNKS
-
-
-def test_load_index_last_n(tmp_path):
+def test_load_index_last_n(tmp_path, requires_mongodb):
     for i in range(10):
         history_store.save_chunk(str(tmp_path), "s", f"chunk {i}", [])
     index = history_store.load_index(str(tmp_path), last_n=3)
     assert len(index) == 3
 
 
-def test_chunk_ids_increment(tmp_path, json_mode):
-    for _ in range(3):
-        history_store.save_chunk(str(tmp_path), "s", "dialogue", [])
-    data = json.loads((tmp_path / ".mcp_history.json").read_text())
-    ids = [c["id"] for c in data["chunks"]]
-    assert ids == ["1", "2", "3"]
-
-
 def test_get_latest_save_empty(tmp_path):
     assert history_store.get_latest_save(str(tmp_path)) == ""
 
 
-def test_get_latest_save_after_chunk(tmp_path):
+def test_get_latest_save_after_chunk(tmp_path, requires_mongodb):
     history_store.save_chunk(str(tmp_path), "s", "hello", [])
     ts = history_store.get_latest_save(str(tmp_path))
     assert ts != ""
@@ -147,7 +115,7 @@ def test_extract_tags_no_match_returns_empty():
 # MCP tool interface tests
 # ---------------------------------------------------------------------------
 
-def test_mcp_save_and_load_index(tmp_path):
+def test_mcp_save_and_load_index(tmp_path, requires_mongodb):
     project = str(tmp_path)
     save_history(project, "user: fixed db query\nassistant: committed")
     result = load_history(project)
@@ -159,7 +127,7 @@ def test_mcp_load_empty(tmp_path):
     assert load_history(str(tmp_path)) == "no history yet"
 
 
-def test_mcp_load_last_n(tmp_path):
+def test_mcp_load_last_n(tmp_path, requires_mongodb):
     project = str(tmp_path)
     for i in range(6):
         save_history(project, f"user: task {i}\nassistant: done")
@@ -168,14 +136,14 @@ def test_mcp_load_last_n(tmp_path):
     assert len(lines) == 3
 
 
-def test_mcp_save_with_explicit_tags(tmp_path):
+def test_mcp_save_with_explicit_tags(tmp_path, requires_mongodb):
     project = str(tmp_path)
     result = save_history(project, "user: deploy to prod\nassistant: done", tags="deployment,configuration")
     assert "deployment" in result
     assert "configuration" in result
 
 
-def test_mcp_get_history_chunks(tmp_path):
+def test_mcp_get_history_chunks(tmp_path, requires_mongodb):
     project = str(tmp_path)
     save_history(project, "user: refactor auth module\nassistant: refactored")
     index = history_store.load_index(project, last_n=1)
@@ -196,7 +164,7 @@ def test_mcp_get_history_chunks_bad_ids(tmp_path):
     assert "no chunks found" in result
 
 
-def test_mcp_stats_in_index(tmp_path):
+def test_mcp_stats_in_index(tmp_path, requires_mongodb):
     project = str(tmp_path)
     dialogue = (
         "user: add a GET /healthz endpoint that returns the service version\n"
@@ -207,7 +175,7 @@ def test_mcp_stats_in_index(tmp_path):
     assert "tokens:" in result
 
 
-def test_mcp_session_id_stored(tmp_path):
+def test_mcp_session_id_stored(tmp_path, requires_mongodb):
     project = str(tmp_path)
     save_history(project, "user: hello\nassistant: hi", session_id="abc123xyz")
     index = history_store.load_index(project, last_n=1)
@@ -215,8 +183,8 @@ def test_mcp_session_id_stored(tmp_path):
     assert chunks[0].get("session_id") == "abc123xy"
 
 
-def test_save_chunk_split_fields_round_trip(tmp_path, json_mode):
-    """group_id / part / total_parts survive a save → get_chunks round-trip (JSON backend)."""
+def test_save_chunk_split_fields_round_trip(tmp_path, requires_mongodb):
+    """group_id / part / total_parts survive a save → get_chunks round-trip."""
     project = str(tmp_path)
     gid = "abc12345"
     history_store.save_chunk(project, "s1", "user: part 1\nassistant: text a", ["feature"],
@@ -237,7 +205,7 @@ def test_save_chunk_split_fields_round_trip(tmp_path, json_mode):
     assert all(c["total_parts"] == 2 for c in split_chunks)
 
 
-def test_save_chunk_no_split_fields_when_unsplit(tmp_path, json_mode):
+def test_save_chunk_no_split_fields_when_unsplit(tmp_path, requires_mongodb):
     """A regular (unsplit) chunk has no group_id / part / total_parts fields."""
     project = str(tmp_path)
     history_store.save_chunk(project, "s1", "user: hello\nassistant: hi", [])
@@ -287,14 +255,11 @@ def test_score_recency_breaks_equal_tag_ties():
 
 def test_score_preview_overlap_boosts_rank():
     """A chunk whose preview shares words with the message ranks above a keyword-only match."""
-    # "deployment" has no keywords matching "postgres" or "query" — tag_score=0
     keyword_only = _make_entry("1", ["deployment"], "update schema", age_days=1)
-    # "feature" also has no keyword match for "postgres query" — tag_score=0, but preview overlaps
     preview_match = _make_entry("2", ["feature"], "postgres query timeout fix", age_days=1)
     scored = history_store.score_chunks(
         [keyword_only, preview_match], "postgres query optimization"
     )
-    # preview_match has 2 overlapping words (postgres, query) → preview_score boost wins
     assert scored[0][1]["id"] == "2"
 
 
@@ -314,9 +279,7 @@ def test_score_returns_all_entries():
 
 def test_score_no_tags_chunk_ranked_by_recency_and_preview():
     """Untagged chunks get tag_score=0 but still get recency + preview signals."""
-    # Use a message that doesn't hit auth keywords so tagged_old gets tag_score=0 too
     tagged_old = _make_entry("1", ["auth"], "login fix", age_days=20)
     untagged_new = _make_entry("2", [], "performance benchmark results", age_days=0)
     scored = history_store.score_chunks([tagged_old, untagged_new], "fix the performance issue")
-    # untagged_new: tag=0, recency≈1.0 → beats 20-day-old tagged_old (tag_score=0, recency≈0.01)
     assert scored[0][1]["id"] == "2"

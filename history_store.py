@@ -255,7 +255,7 @@ def get_chunks(project: str, ids: list) -> tuple:
             oids.append(ObjectId(id_str))
         except Exception:
             pass
-    docs = list(col.find({"_id": {"$in": oids}}).sort("timestamp", -1))
+    docs = list(col.find({"_id": {"$in": oids}, "project": project}).sort("timestamp", -1))
     chunks = [{
         "id": str(doc["_id"]),
         "timestamp": doc.get("timestamp", ""),
