@@ -7,6 +7,7 @@ import fnmatch
 import subprocess
 import re
 import datetime
+import tempfile
 
 import portalocker
 import history_store
@@ -112,11 +113,29 @@ def _load_json_safe(path: pathlib.Path, default: dict) -> dict:
 
 
 def _locked_write(path: pathlib.Path, data: dict) -> None:
-    """Write JSON to path with an exclusive file lock."""
-    with open(path, "w", encoding="utf-8") as f:
-        portalocker.lock(f, portalocker.LOCK_EX)
-        json.dump(data, f, indent=2)
-        portalocker.unlock(f)
+    """Write JSON to path atomically under an exclusive lock.
+
+    Writes to a temp file in the same directory, then renames over the target.
+    The lock file is a sidecar (.lock) so the target is never truncated before
+    the new content is fully written.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with open(lock_path, "a", encoding="utf-8") as lf:
+        portalocker.lock(lf, portalocker.LOCK_EX)
+        try:
+            fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        finally:
+            portalocker.unlock(lf)
 
 
 # ---------------------------------------------------------------------------
