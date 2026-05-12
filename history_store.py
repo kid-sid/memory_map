@@ -213,7 +213,7 @@ def load_index(project: str, last_n: int = 20) -> list:
     cursor = col.find(
         {"project": project},
         {"dialogue": 0},
-    ).sort("timestamp", -1).limit(last_n)
+    ).sort([("timestamp", -1), ("_id", -1)]).limit(last_n)
     return [{
         "id": str(doc["_id"]),
         "timestamp": doc.get("timestamp", ""),
