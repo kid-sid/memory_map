@@ -256,14 +256,21 @@ def get_chunks(project: str, ids: list) -> tuple:
         except Exception:
             pass
     docs = list(col.find({"_id": {"$in": oids}, "project": project}).sort("timestamp", -1))
-    chunks = [{
-        "id": str(doc["_id"]),
-        "timestamp": doc.get("timestamp", ""),
-        "session_id": doc.get("session_id", ""),
-        "dialogue": doc.get("dialogue", ""),
-        "tags": doc.get("tags", []),
-        "stats": doc.get("stats", {}),
-    } for doc in docs]
+    chunks = []
+    for doc in docs:
+        entry = {
+            "id": str(doc["_id"]),
+            "timestamp": doc.get("timestamp", ""),
+            "session_id": doc.get("session_id", ""),
+            "dialogue": doc.get("dialogue", ""),
+            "tags": doc.get("tags", []),
+            "stats": doc.get("stats", {}),
+        }
+        if "group_id" in doc:
+            entry["group_id"] = doc["group_id"]
+            entry["part"] = doc.get("part")
+            entry["total_parts"] = doc.get("total_parts")
+        chunks.append(entry)
     total_tokens = sum(c.get("stats", {}).get("tokens", 0) for c in chunks)
     return chunks, total_tokens
 
