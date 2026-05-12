@@ -421,6 +421,8 @@ def load_memory(project_path: str) -> str:
 @mcp.tool()
 def delete_memory(project_path: str, key: str) -> str:
     """Delete a specific memory entry for a project."""
+    if key.startswith("_"):
+        return "error: keys starting with '_' are reserved and cannot be deleted"
     try:
         data = _read_memory(project_path)
         if key not in data:
