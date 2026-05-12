@@ -61,7 +61,20 @@ def read_watermark(session_id: str) -> int:
 
 
 def write_watermark(session_id: str, line_num: int):
-    _watermark_path(session_id).write_text(str(line_num))
+    # Atomic write: write to a temp file then rename so a concurrent reader
+    # never sees a partial value.
+    p = _watermark_path(session_id)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(str(line_num))
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --- Transcript parsing ---
