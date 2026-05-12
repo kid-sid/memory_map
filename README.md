@@ -1,5 +1,9 @@
 # Memory Map — MCP Server for Claude Code
 
+[![CI](https://github.com/kid-sid/memory_map/actions/workflows/ci.yml/badge.svg)](https://github.com/kid-sid/memory_map/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An MCP server that gives Claude persistent memory and conversation history — so it understands your project from the very first message of every session, without you re-explaining anything.
 
 ## What it does
