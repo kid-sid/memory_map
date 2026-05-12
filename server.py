@@ -595,12 +595,13 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         # Pool 1 — vector search (semantic). Returns [] for short queries or no provider.
         vector_candidates = history_store.search_by_vector(project_path, user_message, limit=10)
 
-        # Pool 2 — tag matching fallback
+        # Pool 2 — BM25 + tag scoring over full history index
         if not vector_candidates:
-            msg_tags = history_store.extract_tags(user_message)
-            tag_candidates = history_store.query_by_tags(project_path, msg_tags, limit=20)
-            scored = history_store.score_chunks(tag_candidates, user_message)
-            ranked = [(entry, sc, "tag") for sc, entry in scored if sc > 0]
+            # Score over all recent history (last 50) so BM25 IDF is computed
+            # over a meaningful corpus, not just the tag-matched subset.
+            all_candidates = history_store.load_index(project_path, last_n=50)
+            scored = history_store.score_chunks(all_candidates, user_message)
+            ranked = [(entry, sc, "bm25") for sc, entry in scored if sc > 0]
         else:
             ranked = [(entry, entry.get("score", 0.0), "vector") for entry in vector_candidates]
 
@@ -630,8 +631,10 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         if not chunks:
             return "no history yet"
 
-        # Present chronologically (oldest first) so the narrative flows naturally.
-        chunks.sort(key=lambda c: c.get("timestamp", ""))
+        # Present by relevance score (highest first) so the most relevant context
+        # is seen first by both the LLM and retrieval benchmarks.  Anchor (score=1.0)
+        # always appears at the top; BM25/vector matches follow; recency fill last.
+        chunks.sort(key=lambda c: -score_map.get(c["id"], ("?", 0.0))[1])
 
         lines = [
             f"=== Relevant History ({len(chunks)} chunks, {total_tokens} tokens) ===",
@@ -640,8 +643,7 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         for chunk in chunks:
             source, score = score_map.get(chunk["id"], ("?", 0.0))
             tag_str = ",".join(chunk.get("tags", [])) or "untagged"
-            score_str = f" score={score:.2f}" if source in ("vector", "tag") else ""
-            lines.append(f"[{chunk['id']}] {chunk['timestamp']} src={source}{score_str} tags:[{tag_str}]")
+            lines.append(f"[{chunk['id']}] {chunk['timestamp']} src={source} score={score:.2f} tags:[{tag_str}]")
             lines.append(chunk.get("dialogue", ""))
             lines.append("")
         return "\n".join(lines)

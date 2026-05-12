@@ -1,0 +1,198 @@
+{
+  "timestamp": "20260512T205751Z",
+  "git": {
+    "commit": "98feb06",
+    "branch": "main",
+    "message": "feat: add retrieval benchmark script with Precision@k, Recall, MRR, nDCG metrics"
+  },
+  "config": {
+    "k": 5,
+    "token_budget": 4000,
+    "num_queries": 8
+  },
+  "aggregate": {
+    "recall@1": 0.062,
+    "recall@3": 0.896,
+    "recall@5": 1.0,
+    "precision@5": 0.325,
+    "mrr": 0.562,
+    "ndcg@5": 0.7,
+    "latency_mean_ms": 117.9,
+    "latency_p95_ms": 125.2
+  },
+  "per_query": [
+    {
+      "description": "auth / JWT",
+      "query": "fix the login and JWT token expiry issue",
+      "relevant_human": [
+        "refactor-auth",
+        "auth-jwt"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "refactor-auth",
+        "auth-jwt",
+        "env-config",
+        "postgres-migration"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "precision@5": 0.4,
+      "mrr": 0.5,
+      "ndcg@5": 0.693,
+      "latency_ms": 125.2
+    },
+    {
+      "description": "database",
+      "query": "postgres database migration failing",
+      "relevant_human": [
+        "postgres-migration",
+        "pytest-fixture",
+        "mongo-index"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "postgres-migration",
+        "mongo-index",
+        "pytest-fixture",
+        "redis-cache"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 0.667,
+      "recall@5": 1.0,
+      "precision@5": 0.6,
+      "mrr": 0.5,
+      "ndcg@5": 0.733,
+      "latency_ms": 108.6
+    },
+    {
+      "description": "deployment / CI",
+      "query": "docker build broken on CI pipeline",
+      "relevant_human": [
+        "docker-deploy",
+        "ci-pipeline"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "docker-deploy",
+        "env-config",
+        "postgres-migration",
+        "mongo-index"
+      ],
+      "recall@1": 0.5,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "precision@5": 0.4,
+      "mrr": 1.0,
+      "ndcg@5": 1.0,
+      "latency_ms": 111.1
+    },
+    {
+      "description": "performance",
+      "query": "slow API response time performance",
+      "relevant_human": [
+        "redis-cache",
+        "mongo-index"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "redis-cache",
+        "postgres-migration",
+        "mongo-index",
+        "pytest-fixture"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 0.5,
+      "recall@5": 1.0,
+      "precision@5": 0.4,
+      "mrr": 0.5,
+      "ndcg@5": 0.651,
+      "latency_ms": 120.4
+    },
+    {
+      "description": "configuration",
+      "query": "environment variable config missing in production",
+      "relevant_human": [
+        "env-config"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "env-config",
+        "redis-cache",
+        "refactor-auth",
+        "mongo-index"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "precision@5": 0.2,
+      "mrr": 0.5,
+      "ndcg@5": 0.631,
+      "latency_ms": 118.4
+    },
+    {
+      "description": "testing",
+      "query": "pytest test fixture database connection",
+      "relevant_human": [
+        "pytest-fixture"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "pytest-fixture",
+        "postgres-migration",
+        "mongo-index",
+        "redis-cache"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "precision@5": 0.2,
+      "mrr": 0.5,
+      "ndcg@5": 0.631,
+      "latency_ms": 119.4
+    },
+    {
+      "description": "API design",
+      "query": "new REST endpoint healthcheck",
+      "relevant_human": [
+        "fastapi-endpoint"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "fastapi-endpoint",
+        "redis-cache",
+        "env-config",
+        "refactor-auth"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "precision@5": 0.2,
+      "mrr": 0.5,
+      "ndcg@5": 0.631,
+      "latency_ms": 120.2
+    },
+    {
+      "description": "refactor",
+      "query": "refactor split large module into smaller files",
+      "relevant_human": [
+        "refactor-auth"
+      ],
+      "retrieved_human": [
+        "ci-pipeline",
+        "refactor-auth",
+        "mongo-index",
+        "fastapi-endpoint",
+        "redis-cache"
+      ],
+      "recall@1": 0.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "precision@5": 0.2,
+      "mrr": 0.5,
+      "ndcg@5": 0.631,
+      "latency_ms": 119.5
+    }
+  ]
+}

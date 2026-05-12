@@ -2,8 +2,15 @@
 """
 Retrieval benchmark for memory_map suggest_history.
 
-Measures Precision@k, MRR, and latency against a fixed test set of
-(query, relevant_chunk_tags) pairs seeded into a temporary MongoDB project.
+Measures Recall@k (primary), Precision@k, MRR, nDCG@k, and latency against
+a fixed test set of (query, relevant_chunk_ids) pairs seeded into a temporary
+MongoDB project.  Results are saved to benchmarks/results/<timestamp>.json
+for tracking improvement across commits.
+
+Inspired by mempalace LongMemEval benchmark approach:
+  - Recall@{1,3,5} as primary metrics (not precision)
+  - Per-query breakdown with pass/fail
+  - JSON result files committed alongside code changes
 
 Usage:
     python benchmarks/bench_retrieval.py
@@ -11,8 +18,12 @@ Usage:
 """
 
 import argparse
+import datetime
+import json
 import math
 import pathlib
+import re
+import subprocess
 import sys
 import time
 import uuid
@@ -21,6 +32,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 import history_store
 from server import suggest_history
+
+RESULTS_DIR = pathlib.Path(__file__).parent / "results"
 
 # ---------------------------------------------------------------------------
 # Seed data — chunks with known content and tags
@@ -120,7 +133,7 @@ SEED_CHUNKS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Evaluation queries — (message, set of chunk IDs that are relevant)
+# Evaluation queries — (message, set of human-readable chunk IDs that are relevant)
 # ---------------------------------------------------------------------------
 
 EVAL_QUERIES = [
@@ -166,34 +179,31 @@ EVAL_QUERIES = [
     },
 ]
 
-
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
-def precision_at_k(retrieved_ids: list, relevant: set, k: int) -> float:
-    top_k = retrieved_ids[:k]
-    hits = sum(1 for id_ in top_k if id_ in relevant)
-    return hits / k if k else 0.0
-
-
-def recall_at_k(retrieved_ids: list, relevant: set, k: int) -> float:
-    top_k = retrieved_ids[:k]
-    hits = sum(1 for id_ in top_k if id_ in relevant)
+def recall_at_k(retrieved: list, relevant: set, k: int) -> float:
+    hits = sum(1 for id_ in retrieved[:k] if id_ in relevant)
     return hits / len(relevant) if relevant else 0.0
 
 
-def reciprocal_rank(retrieved_ids: list, relevant: set) -> float:
-    for i, id_ in enumerate(retrieved_ids, 1):
+def precision_at_k(retrieved: list, relevant: set, k: int) -> float:
+    hits = sum(1 for id_ in retrieved[:k] if id_ in relevant)
+    return hits / k if k else 0.0
+
+
+def reciprocal_rank(retrieved: list, relevant: set) -> float:
+    for i, id_ in enumerate(retrieved, 1):
         if id_ in relevant:
             return 1.0 / i
     return 0.0
 
 
-def ndcg_at_k(retrieved_ids: list, relevant: set, k: int) -> float:
+def ndcg_at_k(retrieved: list, relevant: set, k: int) -> float:
     dcg = sum(
         1.0 / math.log2(i + 2)
-        for i, id_ in enumerate(retrieved_ids[:k])
+        for i, id_ in enumerate(retrieved[:k])
         if id_ in relevant
     )
     ideal = sum(1.0 / math.log2(i + 2) for i in range(min(len(relevant), k)))
@@ -201,18 +211,39 @@ def ndcg_at_k(retrieved_ids: list, relevant: set, k: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Parse suggest_history output → ordered list of chunk IDs
+# Parse suggest_history output → ordered list of MongoDB ObjectId strings
 # ---------------------------------------------------------------------------
 
+_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+
 def parse_retrieved_ids(output: str) -> list:
+    """Extract chunk IDs from suggest_history output in presentation order."""
     ids = []
     for line in output.splitlines():
         line = line.strip()
         if line.startswith("[") and "]" in line:
-            chunk_id = line[1: line.index("]")]
-            if chunk_id and chunk_id != "?":
-                ids.append(chunk_id)
+            candidate = line[1: line.index("]")]
+            if _OBJECT_ID_RE.match(candidate):
+                ids.append(candidate)
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Git metadata for result files
+# ---------------------------------------------------------------------------
+
+def _git_info() -> dict:
+    def _run(cmd):
+        try:
+            return subprocess.check_output(cmd, cwd=str(pathlib.Path(__file__).parent.parent),
+                                           text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            return ""
+    return {
+        "commit": _run(["git", "rev-parse", "--short", "HEAD"]),
+        "branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
+        "message": _run(["git", "log", "-1", "--format=%s"]),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +257,9 @@ def run_benchmark(k: int, token_budget: int, verbose: bool):
         sys.exit(1)
 
     project = f"__benchmark_{uuid.uuid4().hex[:8]}__"
-    print(f"Benchmark project: {project}")
-    print(f"Seeding {len(SEED_CHUNKS)} chunks...")
+    print(f"Benchmark project : {project}")
+    print(f"Seeding {len(SEED_CHUNKS)} chunks into MongoDB...")
 
-    # Map from our human-readable IDs to MongoDB ObjectId strings
     id_map: dict[str, str] = {}
     for chunk in SEED_CHUNKS:
         mongo_id = history_store.save_chunk(
@@ -237,13 +267,15 @@ def run_benchmark(k: int, token_budget: int, verbose: bool):
         )
         id_map[chunk["id"]] = mongo_id
 
-    print(f"Running {len(EVAL_QUERIES)} queries with k={k}, budget={token_budget} tokens...\n")
+    reverse_map = {v: k for k, v in id_map.items()}
 
-    results = []
+    print(f"Running {len(EVAL_QUERIES)} queries  k={k}  budget={token_budget} tokens\n")
+
+    per_query = []
     latencies = []
 
     for q in EVAL_QUERIES:
-        relevant_mongo_ids = {id_map[id_] for id_ in q["relevant"] if id_ in id_map}
+        relevant_mongo = {id_map[i] for i in q["relevant"] if i in id_map}
 
         t0 = time.perf_counter()
         output = suggest_history(project, q["query"], token_budget=token_budget)
@@ -252,57 +284,95 @@ def run_benchmark(k: int, token_budget: int, verbose: bool):
         retrieved = parse_retrieved_ids(output)
         latencies.append(latency_ms)
 
-        p_at_k = precision_at_k(retrieved, relevant_mongo_ids, k)
-        r_at_k = recall_at_k(retrieved, relevant_mongo_ids, k)
-        rr = reciprocal_rank(retrieved, relevant_mongo_ids)
-        ndcg = ndcg_at_k(retrieved, relevant_mongo_ids, k)
+        r1  = recall_at_k(retrieved, relevant_mongo, 1)
+        r3  = recall_at_k(retrieved, relevant_mongo, 3)
+        r5  = recall_at_k(retrieved, relevant_mongo, k)
+        p_k = precision_at_k(retrieved, relevant_mongo, k)
+        rr  = reciprocal_rank(retrieved, relevant_mongo)
+        ndcg = ndcg_at_k(retrieved, relevant_mongo, k)
 
-        results.append({"p": p_at_k, "r": r_at_k, "rr": rr, "ndcg": ndcg})
+        per_query.append({
+            "description": q["description"],
+            "query": q["query"],
+            "relevant_human": list(q["relevant"]),
+            "retrieved_human": [reverse_map.get(i, i) for i in retrieved[:k]],
+            "recall@1": round(r1, 3),
+            "recall@3": round(r3, 3),
+            f"recall@{k}": round(r5, 3),
+            f"precision@{k}": round(p_k, 3),
+            "mrr": round(rr, 3),
+            f"ndcg@{k}": round(ndcg, 3),
+            "latency_ms": round(latency_ms, 1),
+        })
 
         if verbose:
-            hit = any(id_ in relevant_mongo_ids for id_ in retrieved[:k])
+            hit = r5 > 0
             status = "HIT " if hit else "MISS"
             print(
                 f"  [{status}] {q['description']:<20} "
-                f"P@{k}={p_at_k:.2f}  R@{k}={r_at_k:.2f}  "
-                f"RR={rr:.2f}  nDCG@{k}={ndcg:.2f}  "
+                f"R@1={r1:.2f}  R@3={r3:.2f}  R@{k}={r5:.2f}  "
+                f"P@{k}={p_k:.2f}  MRR={rr:.2f}  nDCG@{k}={ndcg:.2f}  "
                 f"{latency_ms:.0f}ms"
             )
-            print(f"         query   : {q['query']}")
-            print(f"         retrieved: {retrieved[:k]}")
-            print(f"         relevant : {list(q['relevant'])}")
+            retrieved_human = [reverse_map.get(i, i) for i in retrieved[:k]]
+            print(f"         retrieved : {retrieved_human}")
+            print(f"         relevant  : {sorted(q['relevant'])}")
+            if output.startswith("error"):
+                print(f"         ERROR     : {output}")
             print()
 
     # Aggregate
-    n = len(results)
-    mean_p    = sum(r["p"]    for r in results) / n
-    mean_r    = sum(r["r"]    for r in results) / n
-    mrr       = sum(r["rr"]   for r in results) / n
-    mean_ndcg = sum(r["ndcg"] for r in results) / n
-    mean_lat  = sum(latencies) / n
-    p95_lat   = sorted(latencies)[int(0.95 * n)]
+    n = len(per_query)
+    agg = {
+        "recall@1":      round(sum(r["recall@1"]           for r in per_query) / n, 3),
+        "recall@3":      round(sum(r["recall@3"]           for r in per_query) / n, 3),
+        f"recall@{k}":   round(sum(r[f"recall@{k}"]       for r in per_query) / n, 3),
+        f"precision@{k}": round(sum(r[f"precision@{k}"]   for r in per_query) / n, 3),
+        "mrr":           round(sum(r["mrr"]                for r in per_query) / n, 3),
+        f"ndcg@{k}":     round(sum(r[f"ndcg@{k}"]         for r in per_query) / n, 3),
+        "latency_mean_ms": round(sum(latencies) / n, 1),
+        "latency_p95_ms":  round(sorted(latencies)[int(0.95 * n)], 1),
+    }
 
     print("=" * 60)
     print(f"Results  (k={k}, {n} queries)")
     print("=" * 60)
-    print(f"  Precision@{k}   : {mean_p:.3f}")
-    print(f"  Recall@{k}      : {mean_r:.3f}")
-    print(f"  MRR            : {mrr:.3f}")
-    print(f"  nDCG@{k}        : {mean_ndcg:.3f}")
-    print(f"  Latency (mean) : {mean_lat:.0f}ms")
-    print(f"  Latency (p95)  : {p95_lat:.0f}ms")
+    print(f"  Recall@1       : {agg['recall@1']:.3f}  <- primary metric")
+    print(f"  Recall@3       : {agg['recall@3']:.3f}")
+    print(f"  Recall@{k:<2}      : {agg[f'recall@{k}']:.3f}")
+    print(f"  Precision@{k}   : {agg[f'precision@{k}']:.3f}")
+    print(f"  MRR            : {agg['mrr']:.3f}")
+    print(f"  nDCG@{k}        : {agg[f'ndcg@{k}']:.3f}")
+    print(f"  Latency (mean) : {agg['latency_mean_ms']:.0f}ms")
+    print(f"  Latency (p95)  : {agg['latency_p95_ms']:.0f}ms")
     print("=" * 60)
+
+    # Save JSON results
+    RESULTS_DIR.mkdir(exist_ok=True)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    result_file = RESULTS_DIR / f"{ts}_k{k}.json"
+    result_data = {
+        "timestamp": ts,
+        "git": _git_info(),
+        "config": {"k": k, "token_budget": token_budget, "num_queries": n},
+        "aggregate": agg,
+        "per_query": per_query,
+    }
+    result_file.write_text(json.dumps(result_data, indent=2), encoding="utf-8")
+    print(f"\nResults saved -> {result_file.relative_to(pathlib.Path(__file__).parent.parent)}")
 
     # Cleanup
     col.delete_many({"project": project})
-    print(f"\nCleaned up {len(SEED_CHUNKS)} benchmark chunks.")
+    print(f"Cleaned up {len(SEED_CHUNKS)} benchmark chunks.")
+
+    return agg
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="memory_map retrieval benchmark")
-    parser.add_argument("--k", type=int, default=3, help="Precision/Recall/nDCG cutoff (default: 3)")
-    parser.add_argument("--budget", type=int, default=2000, help="Token budget for suggest_history (default: 2000)")
-    parser.add_argument("--verbose", action="store_true", help="Print per-query breakdown")
+    parser.add_argument("--k",       type=int, default=5,    help="Recall/Precision/nDCG cutoff (default: 5)")
+    parser.add_argument("--budget",  type=int, default=4000, help="Token budget for suggest_history (default: 4000)")
+    parser.add_argument("--verbose", action="store_true",    help="Print per-query breakdown")
     args = parser.parse_args()
 
     run_benchmark(k=args.k, token_budget=args.budget, verbose=args.verbose)

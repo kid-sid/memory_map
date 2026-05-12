@@ -412,22 +412,88 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
 # Relevance scoring
 # ---------------------------------------------------------------------------
 
+def _bm25_scores(query_terms: list, corpus: list, k1: float = 1.5, b: float = 0.75) -> list:
+    """Okapi BM25 scores for query_terms against each document in corpus.
+
+    IDF uses Lucene-style smoothing: log((N - df + 0.5) / (df + 0.5) + 1).
+    IDF is computed over the candidate set only (same as mempalace searcher.py).
+    Returns a list of float scores, one per document.
+    """
+    N = len(corpus)
+    if N == 0 or not query_terms:
+        return [0.0] * N
+
+    tokenized = [re.sub(r"[^\w\s]", " ", doc.lower()).split() for doc in corpus]
+    avg_len = sum(len(d) for d in tokenized) / N
+
+    df: dict = {}
+    for terms in tokenized:
+        for t in set(terms):
+            df[t] = df.get(t, 0) + 1
+
+    scores = []
+    for doc_terms in tokenized:
+        doc_len = len(doc_terms)
+        tf_map: dict = {}
+        for t in doc_terms:
+            tf_map[t] = tf_map.get(t, 0) + 1
+
+        score = 0.0
+        for term in query_terms:
+            tf = tf_map.get(term, 0)
+            if tf == 0:
+                continue
+            idf = math.log((N - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5) + 1)
+            tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / avg_len))
+            score += idf * tf_norm
+        scores.append(score)
+
+    return scores
+
+
+def _expand_query(msg_lower: str) -> list:
+    """Expand query terms using TAG_KEYWORDS synonyms.
+
+    For every tag whose keywords appear in the message, add all single-word
+    keywords from that tag to the query term set.  This lets "broken auth"
+    match chunks that mention "jwt" or "session" even if those words aren't
+    in the original message.
+    """
+    base_terms = set(re.sub(r"[^\w\s]", " ", msg_lower).split())
+    expanded = set(base_terms)
+    for tag, keywords in _TAG_KEYWORDS.items():
+        if any(kw in msg_lower for kw in keywords):
+            expanded.update(kw for kw in keywords if " " not in kw)
+    return list(expanded)
+
+
 def score_chunks(index: list, user_message: str) -> list:
     """Score and sort index entries by relevance to user_message.
 
-    Three signals combined:
-      - tag-keyword match (0.5): checks _TAG_KEYWORDS values, not tag names
-      - recency decay    (0.3): half-life 3 days — old noise fades out naturally
-      - preview overlap  (0.2): word intersection between message and preview
+    Signals (adapted from mempalace hybrid_v2 approach):
+      - tag-keyword match (0.50): checks _TAG_KEYWORDS values, not tag names
+      - BM25 preview score (0.30): Okapi BM25 over preview text with query expansion
+      - recency decay     (0.20): half-life 3 days — old noise fades out naturally
 
     Returns list of (score: float, entry: dict) sorted by score descending.
     """
+    if not index:
+        return []
+
     now = datetime.datetime.now(datetime.timezone.utc)
     msg_lower = user_message.lower()
-    msg_words = set(re.sub(r"[^\w\s]", " ", msg_lower).split())
+
+    # Expanded query terms for BM25 (adds tag synonyms)
+    query_terms = _expand_query(msg_lower)
+
+    # BM25 over the preview of each candidate (candidate-relative IDF)
+    corpus = [entry.get("preview", "") for entry in index]
+    bm25_raw = _bm25_scores(query_terms, corpus)
+    max_bm25 = max(bm25_raw) if bm25_raw else 1.0
 
     scored = []
-    for entry in index:
+    for i, entry in enumerate(index):
+        # Tag-keyword signal
         tags = entry.get("tags", [])
         tag_hits = sum(
             1 for tag in tags
@@ -435,6 +501,7 @@ def score_chunks(index: list, user_message: str) -> list:
         )
         tag_score = min(tag_hits, 1.0)
 
+        # Recency signal
         try:
             ts = datetime.datetime.strptime(
                 entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ"
@@ -444,12 +511,10 @@ def score_chunks(index: list, user_message: str) -> list:
             age_days = 999
         recency_score = math.exp(-age_days * math.log(2) / 3)
 
-        preview_words = set(
-            re.sub(r"[^\w\s]", " ", entry.get("preview", "").lower()).split()
-        )
-        preview_score = min(len(msg_words & preview_words) / 5.0, 1.0)
+        # BM25 signal (normalised by max in candidate set)
+        bm25_score = bm25_raw[i] / max_bm25 if max_bm25 > 0 else 0.0
 
-        combined = tag_score * 0.5 + recency_score * 0.3 + preview_score * 0.2
+        combined = tag_score * 0.5 + bm25_score * 0.3 + recency_score * 0.2
         scored.append((combined, entry))
 
     return sorted(scored, key=lambda x: -x[0])
