@@ -131,7 +131,7 @@ Open Claude Code and run:
 /mcp
 ```
 
-You should see `memory_map` listed with 17 tools. If it's not there, double-check the path in Step 3.
+You should see `memory_map` listed with 18 tools. If it's not there, double-check the path in Step 3.
 
 ---
 
