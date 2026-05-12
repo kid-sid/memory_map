@@ -277,6 +277,15 @@ def test_score_returns_all_entries():
     assert len(scored) == 5
 
 
+def test_score_rich_tags_not_penalised():
+    """A chunk with more tags scores at least as well as a sparse one when keyword hits are equal."""
+    sparse = _make_entry("1", ["auth"], "fix login", age_days=1)
+    rich = _make_entry("2", ["auth", "deployment", "testing", "feature", "refactor"], "fix login", age_days=1)
+    scored = history_store.score_chunks([sparse, rich], "fix the login flow")
+    scores = {e["id"]: s for s, e in scored}
+    assert scores["2"] >= scores["1"], "extra non-matching tags must not lower the score"
+
+
 def test_score_no_tags_chunk_ranked_by_recency_and_preview():
     """Untagged chunks get tag_score=0 but still get recency + preview signals."""
     tagged_old = _make_entry("1", ["auth"], "login fix", age_days=20)

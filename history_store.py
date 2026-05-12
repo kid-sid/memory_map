@@ -316,7 +316,7 @@ def search_by_vector(project: str, query: str, limit: int = 10,
         vector_search = {
             "index": ATLAS_AUTOEMBED_INDEX,
             "path": "dialogue",
-            "query": query,
+            "queryText": query,
             "numCandidates": limit * 10,
             "limit": limit,
             "filter": {"project": {"$eq": project}},
@@ -426,7 +426,7 @@ def score_chunks(index: list, user_message: str) -> list:
             1 for tag in tags
             if any(kw in msg_lower for kw in _TAG_KEYWORDS.get(tag, []))
         )
-        tag_score = tag_hits / len(tags) if tags else 0.0
+        tag_score = min(tag_hits, 1.0)
 
         try:
             ts = datetime.datetime.strptime(
