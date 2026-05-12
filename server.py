@@ -586,11 +586,14 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         if not recent_candidates:
             return "no history yet"
 
-        # Anchor: most recent chunk, always included for continuity.
+        # Anchor: most recent chunk.  Guaranteed to be included for session
+        # continuity, but scored by BM25 so it ranks by relevance — not fixed at 1.0.
         anchor = recent_candidates[0]
-        selected_ids = [anchor["id"]]
-        score_map = {anchor["id"]: ("anchor", 1.0)}
-        used = anchor["stats"].get("tokens", 0)
+        anchor_id = anchor["id"]
+
+        selected_ids: list = []
+        score_map: dict = {}
+        used = 0
 
         # Pool 1 — vector search (semantic). Returns [] for short queries or no provider.
         vector_candidates = history_store.search_by_vector(project_path, user_message, limit=10)
@@ -606,15 +609,22 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
             ranked = [(entry, entry.get("score", 0.0), "vector") for entry in vector_candidates]
 
         # Add ranked candidates by score (high first) within budget.
+        # The anchor is labelled distinctly but ranked by its actual BM25/vector score.
         for entry, score, source in ranked:
-            if entry["id"] in score_map:
-                continue
             t = entry["stats"].get("tokens", 0)
             if used + t > token_budget:
                 continue
+            final_source = "anchor" if entry["id"] == anchor_id else source
             selected_ids.append(entry["id"])
-            score_map[entry["id"]] = (source, score)
+            score_map[entry["id"]] = (final_source, score)
             used += t
+
+        # Guarantee anchor inclusion: if BM25 didn't select it (very low score or
+        # budget exhausted), force-add it so session continuity is always preserved.
+        if anchor_id not in score_map:
+            selected_ids.append(anchor_id)
+            score_map[anchor_id] = ("anchor", 0.0)
+            used += anchor["stats"].get("tokens", 0)
 
         # Fill remaining budget with recent chunks not yet selected.
         for entry in recent_candidates:
@@ -632,8 +642,7 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
             return "no history yet"
 
         # Present by relevance score (highest first) so the most relevant context
-        # is seen first by both the LLM and retrieval benchmarks.  Anchor (score=1.0)
-        # always appears at the top; BM25/vector matches follow; recency fill last.
+        # is seen first by both the LLM and retrieval benchmarks.
         chunks.sort(key=lambda c: -score_map.get(c["id"], ("?", 0.0))[1])
 
         lines = [

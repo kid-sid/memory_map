@@ -189,6 +189,7 @@ def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
         "timestamp": ts,
         "dialogue": dialogue,
         "preview": dialogue[:100],
+        "bm25_text": dialogue[:500],
         "tags": tags,
         "stats": stats,
     }
@@ -486,8 +487,8 @@ def score_chunks(index: list, user_message: str) -> list:
     # Expanded query terms for BM25 (adds tag synonyms)
     query_terms = _expand_query(msg_lower)
 
-    # BM25 over the preview of each candidate (candidate-relative IDF)
-    corpus = [entry.get("preview", "") for entry in index]
+    # BM25 over bm25_text (500 chars); fall back to preview for older chunks
+    corpus = [entry.get("bm25_text", entry.get("preview", "")) for entry in index]
     bm25_raw = _bm25_scores(query_terms, corpus)
     max_bm25 = max(bm25_raw) if bm25_raw else 1.0
 
