@@ -409,13 +409,28 @@ def save_memory(project_path: str, key: str, content: str) -> str:
 
 
 @mcp.tool()
-def load_memory(project_path: str) -> str:
-    """Load all saved memory for a project. Call this at the start of every session."""
+def load_memory(project_path: str, query: str = "") -> str:
+    """Load saved memory for a project, optionally filtered by a keyword query.
+
+    query: space-separated words; an entry is included if its key or value contains
+    any word (case-insensitive). Omit or pass "" to return all entries.
+    """
     try:
         data = _read_memory(project_path)
         if not any(not k.startswith("_") for k in data):
             return "no memory saved yet"
         level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
+        if query.strip():
+            words = [w.lower() for w in query.split() if w]
+            system = {k: v for k, v in data.items() if k.startswith("_")}
+            matched = {
+                k: v for k, v in data.items()
+                if not k.startswith("_")
+                and any(w in k.lower() or w in str(v).lower() for w in words)
+            }
+            if not matched:
+                return "no matching memory entries"
+            data = {**system, **matched}
         return _compress_memory(data, level)
     except Exception as e:
         return f"error: {e}"
