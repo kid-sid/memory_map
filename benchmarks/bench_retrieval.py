@@ -250,7 +250,7 @@ def _git_info() -> dict:
 # Main benchmark
 # ---------------------------------------------------------------------------
 
-def run_benchmark(k: int, token_budget: int, verbose: bool):
+def run_benchmark(k: int, token_budget: int, verbose: bool, index_wait: int = 0):
     col = history_store._get_collection()
     if col is None:
         print("ERROR: MEMORY_MAP_MONGO_URI is not set — cannot run benchmark.")
@@ -268,6 +268,10 @@ def run_benchmark(k: int, token_budget: int, verbose: bool):
         id_map[chunk["id"]] = mongo_id
 
     reverse_map = {v: k for k, v in id_map.items()}
+
+    if index_wait > 0:
+        print(f"Waiting {index_wait}s for Atlas vector index to sync new chunks...")
+        time.sleep(index_wait)
 
     print(f"Running {len(EVAL_QUERIES)} queries  k={k}  budget={token_budget} tokens\n")
 
@@ -370,9 +374,10 @@ def run_benchmark(k: int, token_budget: int, verbose: bool):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="memory_map retrieval benchmark")
-    parser.add_argument("--k",       type=int, default=5,    help="Recall/Precision/nDCG cutoff (default: 5)")
-    parser.add_argument("--budget",  type=int, default=4000, help="Token budget for suggest_history (default: 4000)")
-    parser.add_argument("--verbose", action="store_true",    help="Print per-query breakdown")
+    parser.add_argument("--k",           type=int, default=5,    help="Recall/Precision/nDCG cutoff (default: 5)")
+    parser.add_argument("--budget",      type=int, default=4000, help="Token budget for suggest_history (default: 4000)")
+    parser.add_argument("--index-wait",  type=int, default=0,    help="Seconds to wait after seeding for Atlas vector index sync (default: 0; use 20 when EMBED_PROVIDER=openai)")
+    parser.add_argument("--verbose",     action="store_true",    help="Print per-query breakdown")
     args = parser.parse_args()
 
-    run_benchmark(k=args.k, token_budget=args.budget, verbose=args.verbose)
+    run_benchmark(k=args.k, token_budget=args.budget, verbose=args.verbose, index_wait=args.index_wait)
