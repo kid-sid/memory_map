@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 
 .mcp_memory.json
+.mcp_memory.json.lock
+*.bak.*
 .mcp_history.json
 .env
 .vscode/
