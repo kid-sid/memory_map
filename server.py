@@ -359,20 +359,38 @@ def _compress_memory(data: dict, level: int = 1) -> str:
     Level 0 (raw):     key: value
     Level 1 (compact): [key] value
     Level 2 (dense):   [shortened_key] abbreviated_value
+
+    Entries not updated in >30 days are annotated with a stale warning.
     """
     entries = {k: v for k, v in data.items() if not k.startswith("_")}
 
     if not entries:
         return "no memory saved yet"
 
+    now = datetime.datetime.now(datetime.timezone.utc)
+    _stale_days = 30
+
+    def _stale_suffix(key: str) -> str:
+        ts_str = data.get(f"_updated_{key}")
+        if not ts_str:
+            return ""
+        try:
+            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = now - ts
+            if age.days >= _stale_days:
+                return f" [stale: {age.days}d old]"
+        except ValueError:
+            pass
+        return ""
+
     if level == 0:
-        return "\n".join(f"{k}: {v}" for k, v in entries.items())
+        return "\n".join(f"{k}: {v}{_stale_suffix(k)}" for k, v in entries.items())
 
     lines = []
     for key, value in entries.items():
         short_key = _shorten_key(key) if level >= 2 else key
         compressed_value = _abbreviate(value) if level >= 2 else value
-        lines.append(f"[{short_key}] {compressed_value}")
+        lines.append(f"[{short_key}] {compressed_value}{_stale_suffix(key)}")
 
     return "\n".join(lines)
 
@@ -393,6 +411,7 @@ def save_memory(project_path: str, key: str, content: str) -> str:
     try:
         data = _read_memory(project_path)
         data[key] = content
+        data[f"_updated_{key}"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         _write_memory(project_path, data)
         return f"saved: {key}"
     except Exception as e:
@@ -437,6 +456,7 @@ def delete_memory(project_path: str, key: str) -> str:
         if key not in data:
             return f"key '{key}' not found"
         del data[key]
+        data.pop(f"_updated_{key}", None)
         _write_memory(project_path, data)
         return f"deleted: {key}"
     except Exception as e:

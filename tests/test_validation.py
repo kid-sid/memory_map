@@ -1,6 +1,7 @@
 import pytest
 import json
-from server import save_memory, load_memory, delete_memory, _load_json_safe
+import datetime
+from server import save_memory, load_memory, delete_memory, _load_json_safe, _read_memory, _write_memory
 import pathlib
 
 
@@ -91,3 +92,37 @@ def test_delete_existing_key(tmp_path):
 def test_delete_nonexistent_key(tmp_path):
     result = delete_memory(str(tmp_path), "ghost")
     assert "not found" in result
+
+
+def test_save_memory_writes_timestamp(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
+    data = _read_memory(str(tmp_path))
+    assert "_updated_stack" in data
+    ts = datetime.datetime.fromisoformat(data["_updated_stack"].replace("Z", "+00:00"))
+    age = datetime.datetime.now(datetime.timezone.utc) - ts
+    assert age.total_seconds() < 5
+
+
+def test_load_memory_stale_warning(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
+    # Back-date the timestamp by 31 days to simulate a stale entry
+    data = _read_memory(str(tmp_path))
+    stale_ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data["_updated_stack"] = stale_ts
+    _write_memory(str(tmp_path), data)
+    result = load_memory(str(tmp_path))
+    assert "stale" in result
+    assert "31d old" in result
+
+
+def test_load_memory_no_stale_warning_for_fresh_entry(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
+    result = load_memory(str(tmp_path))
+    assert "stale" not in result
+
+
+def test_delete_memory_removes_timestamp(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
+    delete_memory(str(tmp_path), "stack")
+    data = _read_memory(str(tmp_path))
+    assert "_updated_stack" not in data
