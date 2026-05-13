@@ -399,7 +399,7 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
     col = _get_collection()
     if col is None:
         return {"backfilled": 0, "skipped": 0, "reason": "MongoDB not configured"}
-    query = {"embedding": {"$exists": False}}
+    query: dict = {"embedding": {"$exists": False}, "embed_failed": {"$exists": False}}
     if project:
         query["project"] = project
 
@@ -413,10 +413,18 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
     for doc in docs:
         dialogue = doc.get("dialogue", "") or ""
         if not dialogue.strip():
+            col.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"embed_failed": True, "embed_error": "empty dialogue"}},
+            )
             failed += 1
             continue
         embedding = _embed(dialogue)
         if embedding is None:
+            col.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"embed_failed": True, "embed_error": "embedding returned None after retries"}},
+            )
             failed += 1
             continue
         col.update_one({"_id": doc["_id"]}, {"$set": {"embedding": embedding}})
