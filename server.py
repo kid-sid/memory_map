@@ -590,7 +590,7 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
 
     Selection logic:
       1. Vector search (if EMBED_PROVIDER configured) + BM25/tag scoring are run
-         in parallel and merged with Reciprocal Rank Fusion (RRF, k=60).  Chunks
+         independently and merged with Reciprocal Rank Fusion (RRF, k=60).  Chunks
          appearing in both lists outrank chunks in only one.
       2. Anchor (most recent chunk) is guaranteed to be included for session
          continuity; it is BM25-scored and ranked like any other candidate.

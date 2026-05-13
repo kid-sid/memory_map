@@ -11,6 +11,9 @@ __pycache__/
 .claude/
 CLAUDE.md
 
+# Benchmark result artifacts — force-add with `git add -f` to commit a baseline
+benchmarks/results/*.json
+
 # Manual dev scripts (hardcoded local paths, superseded by pytest suite)
 tests/test_client.py
 tests/quick_git_test.py

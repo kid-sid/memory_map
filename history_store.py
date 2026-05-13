@@ -512,7 +512,7 @@ def score_chunks(index: list, user_message: str) -> list:
 
     Signals (adapted from mempalace hybrid_v2 approach):
       - tag-keyword match (0.50): checks _TAG_KEYWORDS values, not tag names
-      - BM25 preview score (0.30): Okapi BM25 over preview text with query expansion
+      - BM25 text score (0.30): Okapi BM25 over bm25_text (500 chars, falls back to preview for older chunks)
       - recency decay     (0.20): half-life 3 days — old noise fades out naturally
 
     Returns list of (score: float, entry: dict) sorted by score descending.
