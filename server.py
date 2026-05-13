@@ -238,10 +238,16 @@ def build_github_tree(items: list, max_depth: int) -> dict:
 
 
 @mcp.tool()
-def get_github_structure(repo: str, branch: str = "main") -> str:
-    """Get the file/folder structure of a GitHub repository as minified JSON."""
+def get_github_structure(repo: str, branch: str = "main", max_depth: int = 5) -> str:
+    """Get the file/folder structure of a GitHub repository as minified JSON.
+
+    max_depth controls how many directory levels to include (1–10, default 5).
+    Use a lower value for large monorepos, higher for small repos needing full detail.
+    """
     if "/" not in repo:
         return json.dumps({"error": "repo must be in 'owner/repo' format"})
+    if not (1 <= max_depth <= 10):
+        return json.dumps({"error": "max_depth must be between 1 and 10"})
 
     url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
     headers = {"Accept": "application/vnd.github+json"}
@@ -262,7 +268,7 @@ def get_github_structure(repo: str, branch: str = "main") -> str:
         return json.dumps({"error": f"GitHub API returned {resp.status_code}"})
 
     data = resp.json()
-    tree = build_github_tree(data.get("tree", []), max_depth=5)
+    tree = build_github_tree(data.get("tree", []), max_depth=max_depth)
     result = {repo: tree}
     if data.get("truncated"):
         result["_note"] = "Tree truncated by GitHub — repo may be too large"
