@@ -23,7 +23,7 @@ An MCP server that gives Claude persistent memory and conversation history — s
 - Python 3.10+
 - Git installed and on your PATH
 - [Claude Code](https://claude.ai/code) CLI installed
-- (Optional) MongoDB — local or Atlas — for persistent history storage. Falls back to a local JSON file if not configured.
+- MongoDB — local or Atlas — for persistent conversation history storage
 
 ---
 
@@ -57,7 +57,7 @@ pip install -r requirements.txt
 Create a `.env` file in the repo root:
 
 ```bash
-# MongoDB connection string (optional — falls back to JSON if not set)
+# MongoDB connection string — required for conversation history
 # Local:  mongodb://localhost:27017
 # Atlas:  mongodb+srv://<user>:<password>@<cluster>.mongodb.net
 MEMORY_MAP_MONGO_URI=
@@ -71,13 +71,13 @@ MEMORY_MAP_MONGO_URI=
 # GITHUB_TOKEN=
 ```
 
-If `MEMORY_MAP_MONGO_URI` is left blank, history is stored in `.mcp_history.json` per project.
+If `MEMORY_MAP_MONGO_URI` is left blank, history tools (`suggest_history`, `save_history`, etc.) return an error. Key-value memory (`save_memory` / `load_memory`) works without MongoDB.
 
 ---
 
-### Step 2b — MongoDB setup (optional)
+### Step 2b — MongoDB setup (required for history)
 
-By default, conversation history is stored in a `.mcp_history.json` file per project (up to 100 chunks). MongoDB is optional but gives you unlimited history, persistence across reinstalls, and faster indexed lookups.
+Conversation history is stored in MongoDB. Without it, the key-value memory tools still work but all history tools (`suggest_history`, `save_history`, `load_history`) return an error. MongoDB gives you unlimited history, persistence across reinstalls, and indexed lookups.
 
 **Install MongoDB Community Server**
 
@@ -101,16 +101,6 @@ That's all. The server creates the database and collection automatically on firs
 | Log files | `C:\Program Files\MongoDB\Server\<version>\log\` |
 | Database | `memory_map` (created automatically) |
 | Collection | `memory_map.history` (created automatically) |
-
-**Require MongoDB (no JSON fallback)**
-
-If you want the server to error loudly instead of silently falling back to JSON when MongoDB is unreachable, add:
-
-```
-MEMORY_MAP_REQUIRE_MONGO=1
-```
-
-Without this flag, the server falls back to JSON with a warning if MongoDB is down. With it, every tool call fails with a clear error until MongoDB is reachable — useful if you rely on MongoDB history and never want silent data splitting.
 
 ---
 
@@ -140,7 +130,7 @@ Open Claude Code and run:
 /mcp
 ```
 
-You should see `memory_map` listed with 19 tools. If it's not there, double-check the path in Step 3.
+You should see `memory_map` listed with 20 tools. If it's not there, double-check the path in Step 3.
 
 ---
 
@@ -243,10 +233,7 @@ When you open a project that has `CLAUDE.md`:
 
 ### Where history is stored
 
-| Backend | Storage location |
-|---|---|
-| JSON (default) | `<your-project>/.mcp_history.json` — one file, stays in the project directory |
-| MongoDB | `memory_map.history` collection — filtered by `project` field (the `cwd`) |
+History lives in MongoDB (`memory_map.history` collection), filtered by the `project` field (the `cwd`). Each project gets its own isolated namespace — nothing bleeds between projects. Key-value memory is stored in `.mcp_memory.json` per project (file-based, no MongoDB needed).
 
 ### Per-project memory keys
 
@@ -398,11 +385,13 @@ After every Q&A exchange, the hook saves the dialogue to MongoDB (or a local JSO
 
 **At session start**, Claude calls `suggest_history`, which uses a hybrid retrieval strategy:
 
-1. **Vector search** (when `MEMORY_MAP_EMBED_PROVIDER=openai` or `local`) — semantic similarity search across all stored chunks using OpenAI or local sentence-transformers embeddings
-2. **BM25 scoring** — Okapi BM25 keyword scoring over the last 50 chunks, with query expansion via tag-keyword synonyms
-3. **Reciprocal Rank Fusion (RRF)** — merges the vector and BM25 ranked lists; chunks appearing in both lists rank higher than chunks in only one
-4. **Anchor** — the most recent chunk is always included for session continuity, ranked by its BM25 score
-5. **Token budget** — results are selected relevance-first until the budget is filled
+1. **Concurrent fetch** — vector search and BM25/tag scoring run in parallel to minimise latency
+2. **Vector search** (when `MEMORY_MAP_EMBED_PROVIDER=openai` or `local`) — semantic similarity over all stored chunks using OpenAI `text-embedding-3-small` or local `all-MiniLM-L6-v2`
+3. **BM25 scoring** — Okapi BM25 keyword scoring over the last 50 chunks, with query expansion via tag-keyword synonyms
+4. **Reciprocal Rank Fusion (RRF)** — merges the vector and BM25 ranked lists; chunks in both lists outrank chunks in only one
+5. **MMR re-ranking** — Maximal Marginal Relevance penalises redundant chunks so the result set covers more distinct topics (configurable `diversity` 0.0–1.0, default 0.3)
+6. **Anchor** — the most recent chunk is always included for session continuity
+7. **Token budget** — results selected relevance-first until the budget is filled
 
 ```
 === Relevant History (3 chunks, 650 tokens) ===
@@ -481,8 +470,8 @@ Useful when conversations get long, before switching topics, or before closing a
 
 | Tool | Args | Description |
 |---|---|---|
-| `save_memory` | `project_path`, `key`, `content` | Save or update a context entry |
-| `load_memory` | `project_path` | Load all saved context (compressed) |
+| `save_memory` | `project_path`, `key`, `content` | Save or update a context entry. Returns a warning if the new value is semantically similar (word Jaccard ≥ 0.7) to an existing entry — the save always succeeds |
+| `load_memory` | `project_path`, `query=""`, `top_k=10` | Load saved context (compressed). Pass a query to get TF-IDF ranked results |
 | `delete_memory` | `project_path`, `key` | Remove a specific entry |
 | `set_compression` | `project_path`, `level` | Set compression level (0, 1, or 2) |
 
@@ -490,8 +479,9 @@ Useful when conversations get long, before switching topics, or before closing a
 
 | Tool | Args | Description |
 |---|---|---|
-| `suggest_history` | `project_path`, `user_message`, `token_budget=2000` | **Primary session-start tool.** Hybrid retrieval: vector search + BM25 merged with RRF. Always includes the most recent chunk; ranks remaining by relevance within the token budget |
-| `save_history` | `project_path`, `dialogue`, `session_id`, `tags` | Save a raw conversation chunk with auto-extracted tags |
+| `suggest_history` | `project_path`, `user_message`, `token_budget=2000`, `diversity=0.3` | **Primary session-start tool.** Hybrid retrieval: concurrent vector search + BM25, merged with RRF, re-ranked with MMR. Always includes the most recent chunk; fills remaining budget relevance-first |
+| `save_history` | `project_path`, `dialogue`, `session_id`, `tags` | Save a raw conversation chunk with auto-extracted tags. Auto-summarises oldest chunks if total tokens exceed `MCP_HISTORY_MAX_TOKENS` |
+| `summarise_history` | `project_path`, `n=10` | Collapse the n oldest non-summary chunks into one summary chunk. Triggered automatically by `save_history`; call manually to compact immediately |
 | `load_history` | `project_path`, `last_n=5` | Load the tag index for recent chunks (id, timestamp, tags, preview, token cost) — use for inspection or `/mem_save` flow |
 | `get_history_chunks` | `project_path`, `ids` | Fetch full dialogue for comma-separated chunk IDs + total token sum |
 | `backfill_history_embeddings` | `project_path=""`, `batch_size=20` | Generate embeddings for chunks saved before `MEMORY_MAP_EMBED_PROVIDER` was configured. Run repeatedly until `remaining=0` |
@@ -514,14 +504,15 @@ Useful when conversations get long, before switching topics, or before closing a
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_MAP_MONGO_URI` | _(unset)_ | MongoDB connection string. Falls back to JSON if not set. |
-| `MEMORY_MAP_REQUIRE_MONGO` | _(unset)_ | Set to `1` to error instead of falling back to JSON when MongoDB is unreachable. |
-| `MEMORY_MAP_EMBED_PROVIDER` | _(unset)_ | `openai` — vector search via OpenAI `text-embedding-3-small` (1536 dims); `local` — vector search via `sentence-transformers all-MiniLM-L6-v2` (384 dims, CPU, no API key, ~90 MB first-run download). BM25-only if unset. |
-| `MEMORY_MAP_MIN_VECTOR_SCORE` | `0.65` | Minimum cosine similarity threshold for vector search results. |
+| `MEMORY_MAP_MONGO_URI` | _(unset)_ | MongoDB connection string. Required for all history tools. |
+| `MEMORY_MAP_EMBED_PROVIDER` | _(unset)_ | `openai` — vector search via OpenAI `text-embedding-3-small` (1536 dims); `local` — vector search via `sentence-transformers all-MiniLM-L6-v2` (384 dims, CPU, no API key, ~90 MB first-run download); `atlas` — Atlas autoEmbed (Voyage-4). BM25-only if unset. |
+| `MEMORY_MAP_MIN_VECTOR_SCORE` | `0.65` | Minimum Atlas vectorSearchScore threshold (below = noise). |
 | `OPENAI_API_KEY` | _(unset)_ | Required when `MEMORY_MAP_EMBED_PROVIDER=openai`. |
 | `GITHUB_TOKEN` | _(unset)_ | GitHub token for private repos / higher rate limits |
 | `MCP_MAX_ENTRY_KB` | `10` | Max size per memory entry in KB |
 | `MCP_GIT_TIMEOUT` | `10` | Timeout in seconds for git commands |
+| `MCP_HISTORY_MAX_TOKENS` | `50000` | Total token threshold that triggers auto-summarisation in `save_history` |
+| `MCP_HISTORY_SUMMARISE_N` | `10` | Number of oldest chunks to collapse per auto-summarise pass |
 | `MCP_MAX_TURN_CHARS` | `3000` | Max characters captured per turn before truncation |
 | `MCP_MAX_CHUNK_CHARS` | `4000` | Max characters per saved history chunk; larger Q&A pairs are split into overlapping chunks |
 | `MCP_OVERLAP_CHARS` | `100` | Overlap between split chunks so context at boundaries is preserved |
@@ -535,15 +526,19 @@ Useful when conversations get long, before switching topics, or before closing a
 python -m pytest tests/ -v
 ```
 
-119 tests across 5 files:
+139 tests across 7 files:
 
 | File | Coverage |
 |---|---|
 | `test_compression.py` | 3-level compression, abbreviation, filler removal |
-| `test_history.py` | Save/load/fetch, stats, tag extraction, split chunks, MCP tool interface, BM25 relevance scoring, RRF merge |
+| `test_history.py` | Save/load/fetch, stats, tag extraction, split chunks, BM25 scoring, RRF merge, MMR re-ranking, token counting, auto-summarise |
 | `test_e2e.py` | Full hook→storage→MCP retrieval journeys, per-pair saving, split chunks, token budget, suggest_history relevance |
 | `test_multi_project.py` | Cross-project tools, global memory |
-| `test_validation.py` | Key validation, size limits, corrupted JSON recovery |
+| `test_new_features.py` | load_memory query filtering, max_depth in multi-project tools, gitignore handling |
+| `test_validation.py` | Key validation, size limits, corrupted JSON recovery, TF-IDF ranking, save_memory similarity warning |
+| `test_client.py` | MCP client connectivity |
+
+Tests requiring a live MongoDB connection use the `requires_mongodb` fixture and are skipped automatically when `MEMORY_MAP_MONGO_URI` is unset.
 
 ---
 
