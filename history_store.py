@@ -39,6 +39,8 @@ EMBED_PROVIDER = os.environ.get("MEMORY_MAP_EMBED_PROVIDER", "").lower()
 ATLAS_AUTOEMBED_INDEX = "history_autoembed_index"
 ATLAS_VECTOR_INDEX = "history_vector_index"
 
+_openai_client = None  # lazy singleton — created once, reused across calls and retries
+
 
 def _embed(text: str) -> list | None:
     """Return an OpenAI embedding vector, or None on failure.
@@ -47,6 +49,8 @@ def _embed(text: str) -> list | None:
     failures (rate limits, network blips). Truncates to EMBED_MAX_CHARS so we
     never exceed the model's token limit.
     """
+    global _openai_client
+
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         logger.warning("memory_map: OPENAI_API_KEY not set — skipping embedding")
@@ -56,12 +60,19 @@ def _embed(text: str) -> list | None:
     if not text.strip():
         return None
 
+    if _openai_client is None:
+        try:
+            from openai import OpenAI
+            _openai_client = OpenAI(api_key=api_key)
+        except ImportError:
+            logger.warning("memory_map: openai package not installed — skipping embedding")
+            return None
+
     import time
     last_exc = None
     for attempt in range(EMBED_RETRIES):
         try:
-            from openai import OpenAI
-            response = OpenAI(api_key=api_key).embeddings.create(model=EMBED_MODEL, input=text)
+            response = _openai_client.embeddings.create(model=EMBED_MODEL, input=text)
             return response.data[0].embedding
         except Exception as exc:
             last_exc = exc
