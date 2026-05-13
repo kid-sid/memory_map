@@ -7,6 +7,7 @@ import subprocess
 import re
 import math
 import datetime
+import concurrent.futures
 import tempfile
 
 import pathspec
@@ -657,7 +658,7 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
 
     Selection logic:
       1. Vector search (if EMBED_PROVIDER configured) + BM25/tag scoring are run
-         independently and merged with Reciprocal Rank Fusion (RRF, k=60).  Chunks
+         concurrently and merged with Reciprocal Rank Fusion (RRF, k=60).  Chunks
          appearing in both lists outrank chunks in only one.
       2. Anchor (most recent chunk) is guaranteed to be included for session
          continuity; it is BM25-scored and ranked like any other candidate.
@@ -683,13 +684,22 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         score_map: dict = {}
         used = 0
 
-        # Pool 1 — vector search (semantic). Returns [] when no provider is configured.
-        vector_candidates = history_store.search_by_vector(project_path, user_message, limit=10)
-        vector_ranked = [(e, e.get("score", 0.0), "vector") for e in vector_candidates]
+        # Pool 1 (vector) and Pool 2 (BM25) are independent — run concurrently.
+        # Vector search is I/O-bound (network + Atlas); BM25 is CPU-bound (pure).
+        # GIL is released during I/O, so the embedding API call overlaps with BM25.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            vec_future = pool.submit(
+                history_store.search_by_vector, project_path, user_message, 10
+            )
+            bm25_future = pool.submit(
+                lambda: history_store.score_chunks(
+                    history_store.load_index(project_path, last_n=50), user_message
+                )
+            )
+            vector_candidates = vec_future.result()
+            scored = bm25_future.result()
 
-        # Pool 2 — BM25 + tag scoring over full history (always runs).
-        all_candidates = history_store.load_index(project_path, last_n=50)
-        scored = history_store.score_chunks(all_candidates, user_message)
+        vector_ranked = [(e, e.get("score", 0.0), "vector") for e in vector_candidates]
         bm25_ranked = [(entry, sc, "bm25") for sc, entry in scored if sc > 0]
 
         # Merge both pools with Reciprocal Rank Fusion.  A chunk in both lists
