@@ -63,7 +63,8 @@ Create a `.env` file in the repo root:
 MEMORY_MAP_MONGO_URI=
 
 # Embedding provider for vector search (optional — BM25-only if not set)
-# MEMORY_MAP_EMBED_PROVIDER=openai
+# MEMORY_MAP_EMBED_PROVIDER=openai   # OpenAI text-embedding-3-small (requires OPENAI_API_KEY)
+# MEMORY_MAP_EMBED_PROVIDER=local    # sentence-transformers all-MiniLM-L6-v2 (CPU, no API key)
 # OPENAI_API_KEY=
 
 # GitHub token for higher API rate limits and private repos (optional)
@@ -228,7 +229,7 @@ Nothing bleeds between projects.
 
 No manual action needed. Each save extracts intent tags (`bug-fix`, `database`, `feature`, etc.) by local keyword matching — no LLM calls required. File edits and shell commands made during the response are also captured alongside the dialogue text.
 
-If `MEMORY_MAP_EMBED_PROVIDER=openai` is set, embeddings are generated asynchronously in the background via `backfill_history_embeddings` — the hook always returns immediately regardless.
+If `MEMORY_MAP_EMBED_PROVIDER=openai` or `local` is set, embeddings are generated asynchronously in the background via `backfill_history_embeddings` — the hook always returns immediately regardless.
 
 If a Q&A pair exceeds 4000 characters, it is automatically split into overlapping chunks linked by a shared `group_id` so context at chunk boundaries is never lost.
 
@@ -397,7 +398,7 @@ After every Q&A exchange, the hook saves the dialogue to MongoDB (or a local JSO
 
 **At session start**, Claude calls `suggest_history`, which uses a hybrid retrieval strategy:
 
-1. **Vector search** (when `MEMORY_MAP_EMBED_PROVIDER=openai`) — semantic similarity search across all stored chunks using OpenAI embeddings
+1. **Vector search** (when `MEMORY_MAP_EMBED_PROVIDER=openai` or `local`) — semantic similarity search across all stored chunks using OpenAI or local sentence-transformers embeddings
 2. **BM25 scoring** — Okapi BM25 keyword scoring over the last 50 chunks, with query expansion via tag-keyword synonyms
 3. **Reciprocal Rank Fusion (RRF)** — merges the vector and BM25 ranked lists; chunks appearing in both lists rank higher than chunks in only one
 4. **Anchor** — the most recent chunk is always included for session continuity, ranked by its BM25 score
@@ -515,7 +516,7 @@ Useful when conversations get long, before switching topics, or before closing a
 |---|---|---|
 | `MEMORY_MAP_MONGO_URI` | _(unset)_ | MongoDB connection string. Falls back to JSON if not set. |
 | `MEMORY_MAP_REQUIRE_MONGO` | _(unset)_ | Set to `1` to error instead of falling back to JSON when MongoDB is unreachable. |
-| `MEMORY_MAP_EMBED_PROVIDER` | _(unset)_ | Set to `openai` to enable vector search using `text-embedding-3-small`. BM25-only retrieval is used if unset. |
+| `MEMORY_MAP_EMBED_PROVIDER` | _(unset)_ | `openai` — vector search via OpenAI `text-embedding-3-small` (1536 dims); `local` — vector search via `sentence-transformers all-MiniLM-L6-v2` (384 dims, CPU, no API key, ~90 MB first-run download). BM25-only if unset. |
 | `MEMORY_MAP_MIN_VECTOR_SCORE` | `0.65` | Minimum cosine similarity threshold for vector search results. |
 | `OPENAI_API_KEY` | _(unset)_ | Required when `MEMORY_MAP_EMBED_PROVIDER=openai`. |
 | `GITHUB_TOKEN` | _(unset)_ | GitHub token for private repos / higher rate limits |

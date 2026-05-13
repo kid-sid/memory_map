@@ -32,58 +32,86 @@ MIN_VECTOR_SCORE = float(os.environ.get("MEMORY_MAP_MIN_VECTOR_SCORE", "0.65"))
 MIN_QUERY_CHARS = 4
 
 # "openai"  → generate embeddings via OpenAI, store on doc, search with queryVector
+# "local"   → generate embeddings via sentence-transformers (CPU, no API key), search with queryVector
 # "atlas"   → Atlas autoEmbed (Voyage-4), no client-side embedding, search with queryText
 # ""        → no vector search, fall back to keyword tag matching
 EMBED_PROVIDER = os.environ.get("MEMORY_MAP_EMBED_PROVIDER", "").lower()
 
+LOCAL_EMBED_MODEL = "all-MiniLM-L6-v2"  # 384-dim, CPU-friendly, ~90MB download on first use
+LOCAL_EMBED_DIMS = 384
+
 ATLAS_AUTOEMBED_INDEX = "history_autoembed_index"
 ATLAS_VECTOR_INDEX = "history_vector_index"
 
-_openai_client = None  # lazy singleton — created once, reused across calls and retries
+_openai_client = None   # lazy singleton for openai provider
+_local_embed_model = None  # lazy singleton for local provider
 
 
 def _embed(text: str) -> list | None:
-    """Return an OpenAI embedding vector, or None on failure.
+    """Return an embedding vector for the active EMBED_PROVIDER, or None on failure.
 
-    Retries up to EMBED_RETRIES times with exponential backoff for transient
-    failures (rate limits, network blips). Truncates to EMBED_MAX_CHARS so we
-    never exceed the model's token limit.
+    "openai": calls OpenAI text-embedding-3-small (1536 dims); retries with backoff.
+    "local":  calls sentence-transformers all-MiniLM-L6-v2 (384 dims); CPU, no API key.
+    Other providers return None immediately (they handle embeddings differently).
+    Truncates input to EMBED_MAX_CHARS before encoding.
     """
-    global _openai_client
-
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        logger.warning("memory_map: OPENAI_API_KEY not set — skipping embedding")
-        return None
+    global _openai_client, _local_embed_model
 
     text = text[:EMBED_MAX_CHARS] if text else ""
     if not text.strip():
         return None
 
-    if _openai_client is None:
-        try:
-            from openai import OpenAI
-            _openai_client = OpenAI(api_key=api_key)
-        except ImportError:
-            logger.warning("memory_map: openai package not installed — skipping embedding")
+    if EMBED_PROVIDER == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            logger.warning("memory_map: OPENAI_API_KEY not set — skipping embedding")
             return None
 
-    import time
-    last_exc = None
-    for attempt in range(EMBED_RETRIES):
-        try:
-            response = _openai_client.embeddings.create(model=EMBED_MODEL, input=text)
-            return response.data[0].embedding
-        except Exception as exc:
-            last_exc = exc
-            if attempt < EMBED_RETRIES - 1:
-                wait = 2 ** attempt
-                logger.warning("memory_map: embedding attempt %d failed (%s), retrying in %ds",
-                               attempt + 1, exc, wait)
-                time.sleep(wait)
+        if _openai_client is None:
+            try:
+                from openai import OpenAI
+                _openai_client = OpenAI(api_key=api_key)
+            except ImportError:
+                logger.warning("memory_map: openai package not installed — skipping embedding")
+                return None
 
-    logger.error("memory_map: OpenAI embedding failed after %d attempts (%s) — chunk saved without vector",
-                 EMBED_RETRIES, last_exc)
+        import time
+        last_exc = None
+        for attempt in range(EMBED_RETRIES):
+            try:
+                response = _openai_client.embeddings.create(model=EMBED_MODEL, input=text)
+                return response.data[0].embedding
+            except Exception as exc:
+                last_exc = exc
+                if attempt < EMBED_RETRIES - 1:
+                    wait = 2 ** attempt
+                    logger.warning("memory_map: embedding attempt %d failed (%s), retrying in %ds",
+                                   attempt + 1, exc, wait)
+                    time.sleep(wait)
+
+        logger.error("memory_map: OpenAI embedding failed after %d attempts (%s) — chunk saved without vector",
+                     EMBED_RETRIES, last_exc)
+        return None
+
+    if EMBED_PROVIDER == "local":
+        if _local_embed_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                _local_embed_model = SentenceTransformer(LOCAL_EMBED_MODEL)
+            except ImportError:
+                logger.warning(
+                    "memory_map: sentence-transformers not installed — skipping local embedding. "
+                    "Install with: pip install sentence-transformers"
+                )
+                return None
+
+        try:
+            vector = _local_embed_model.encode(text, normalize_embeddings=True)
+            return vector.tolist()
+        except Exception as exc:
+            logger.error("memory_map: local embedding failed (%s)", exc)
+            return None
+
     return None
 
 # Per-tag keyword sets.  The dialogue is lowercased before matching, so all
@@ -210,7 +238,7 @@ def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
         "tags": tags,
         "stats": stats,
     }
-    if embed and EMBED_PROVIDER == "openai":
+    if embed and EMBED_PROVIDER in ("openai", "local"):
         embedding = _embed(dialogue)
         if embedding is not None:
             doc["embedding"] = embedding
@@ -312,6 +340,7 @@ def search_by_vector(project: str, query: str, limit: int = 10,
 
     Provider is selected by MEMORY_MAP_EMBED_PROVIDER:
       "openai" → client-side OpenAI embeddings + history_vector_index (queryVector)
+      "local"  → client-side sentence-transformers embeddings + history_vector_index (queryVector)
       "atlas"  → Atlas autoEmbed (Voyage-4) + history_autoembed_index (queryText)
       ""       → returns [] so suggest_history falls back to tag matching
 
@@ -323,7 +352,7 @@ def search_by_vector(project: str, query: str, limit: int = 10,
     if min_score is None:
         min_score = MIN_VECTOR_SCORE
 
-    if EMBED_PROVIDER == "openai":
+    if EMBED_PROVIDER in ("openai", "local"):
         embedding = _embed(query)
         if embedding is None:
             return []
@@ -391,10 +420,10 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
 
     Useful after enabling vector search to make pre-existing chunks searchable.
     If project is None, backfills across all projects. Returns counts.
-    Only meaningful when EMBED_PROVIDER=openai; atlas autoEmbed handles its own.
+    Only meaningful when EMBED_PROVIDER=openai or local; atlas autoEmbed handles its own.
     """
-    if EMBED_PROVIDER != "openai":
-        return {"backfilled": 0, "skipped": 0, "reason": f"backfill only applies to openai provider, current={EMBED_PROVIDER!r}"}
+    if EMBED_PROVIDER not in ("openai", "local"):
+        return {"backfilled": 0, "skipped": 0, "reason": f"backfill only applies to openai/local provider, current={EMBED_PROVIDER!r}"}
 
     col = _get_collection()
     if col is None:
