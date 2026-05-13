@@ -258,20 +258,27 @@ def run_benchmark(k: int, token_budget: int, verbose: bool, index_wait: int = 0)
 
     project = f"__benchmark_{uuid.uuid4().hex[:8]}__"
     print(f"Benchmark project : {project}")
-    print(f"Seeding {len(SEED_CHUNKS)} chunks into MongoDB...")
+    embed_provider = history_store.EMBED_PROVIDER
+    print(f"Seeding {len(SEED_CHUNKS)} chunks into MongoDB...  (embed_provider={embed_provider!r})")
 
     id_map: dict[str, str] = {}
     for chunk in SEED_CHUNKS:
+        # embed=False — we batch-embed all chunks after seeding (one API call instead of N).
         mongo_id = history_store.save_chunk(
-            project, "bench", chunk["dialogue"], chunk["tags"]
+            project, "bench", chunk["dialogue"], chunk["tags"], embed=False
         )
         id_map[chunk["id"]] = mongo_id
 
     reverse_map = {v: k for k, v in id_map.items()}
 
-    if index_wait > 0:
-        print(f"Waiting {index_wait}s for Atlas vector index to sync new chunks...")
-        time.sleep(index_wait)
+    # Batch-embed all seeded chunks in a single API call, then wait for Atlas to index.
+    if embed_provider in ("openai", "local"):
+        print(f"Embedding {len(SEED_CHUNKS)} chunks via {embed_provider!r} provider (batch)...")
+        result = history_store.backfill_embeddings(project=project, batch_size=len(SEED_CHUNKS) + 1)
+        print(f"  backfill: {result}")
+        auto_wait = index_wait if index_wait > 0 else (20 if embed_provider == "openai" else 2)
+        print(f"Waiting {auto_wait}s for Atlas vector index to sync...")
+        time.sleep(auto_wait)
 
     print(f"Running {len(EVAL_QUERIES)} queries  k={k}  budget={token_budget} tokens\n")
 

@@ -17,6 +17,9 @@ import history_store
 
 mcp = FastMCP("file-structure")
 
+# Persistent pool — avoids per-call thread creation overhead in suggest_history.
+_suggest_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="suggest")
+
 DEFAULT_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "dist", ".next", ".mypy_cache", ".pytest_cache"}
 
 MEMORY_FILE = ".mcp_memory.json"
@@ -687,17 +690,16 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         # Pool 1 (vector) and Pool 2 (BM25) are independent — run concurrently.
         # Vector search is I/O-bound (network + Atlas); BM25 is CPU-bound (pure).
         # GIL is released during I/O, so the embedding API call overlaps with BM25.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            vec_future = pool.submit(
-                history_store.search_by_vector, project_path, user_message, 10
+        vec_future = _suggest_executor.submit(
+            history_store.search_by_vector, project_path, user_message, 10
+        )
+        bm25_future = _suggest_executor.submit(
+            lambda: history_store.score_chunks(
+                history_store.load_index(project_path, last_n=50), user_message
             )
-            bm25_future = pool.submit(
-                lambda: history_store.score_chunks(
-                    history_store.load_index(project_path, last_n=50), user_message
-                )
-            )
-            vector_candidates = vec_future.result()
-            scored = bm25_future.result()
+        )
+        vector_candidates = vec_future.result()
+        scored = bm25_future.result()
 
         vector_ranked = [(e, e.get("score", 0.0), "vector") for e in vector_candidates]
         bm25_ranked = [(entry, sc, "bm25") for sc, entry in scored if sc > 0]

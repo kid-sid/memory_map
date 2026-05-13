@@ -114,6 +114,52 @@ def _embed(text: str) -> list | None:
 
     return None
 
+
+def _embed_batch(texts: list) -> list:
+    """Embed multiple texts in a single OpenAI API call (openai provider only).
+
+    Returns a list of embedding vectors aligned to the input list.
+    Any text that fails gets None at its position.
+    Falls back to one-by-one _embed() if the batch call fails.
+    """
+    global _openai_client
+
+    if EMBED_PROVIDER != "openai" or not texts:
+        return [None] * len(texts)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return [None] * len(texts)
+
+    if _openai_client is None:
+        try:
+            from openai import OpenAI
+            _openai_client = OpenAI(api_key=api_key)
+        except ImportError:
+            return [None] * len(texts)
+
+    truncated = [t[:EMBED_MAX_CHARS] if t else "" for t in texts]
+
+    import time
+    last_exc = None
+    for attempt in range(EMBED_RETRIES):
+        try:
+            response = _openai_client.embeddings.create(model=EMBED_MODEL, input=truncated)
+            ordered = sorted(response.data, key=lambda x: x.index)
+            return [item.embedding for item in ordered]
+        except Exception as exc:
+            last_exc = exc
+            if attempt < EMBED_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning("memory_map: batch embedding attempt %d failed (%s), retrying in %ds",
+                               attempt + 1, exc, wait)
+                time.sleep(wait)
+
+    logger.error("memory_map: batch embedding failed after %d attempts (%s) — falling back to one-by-one",
+                 EMBED_RETRIES, last_exc)
+    return [_embed(t) for t in texts]
+
+
 # Per-tag keyword sets.  The dialogue is lowercased before matching, so all
 # entries here must be lowercase.  Longer / more specific terms score higher
 # because they're matched as substrings rather than whole words, giving file
@@ -439,6 +485,9 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
 
     backfilled = 0
     failed = 0
+
+    # Separate valid docs from empty ones upfront.
+    valid_docs = []
     for doc in docs:
         dialogue = doc.get("dialogue", "") or ""
         if not dialogue.strip():
@@ -447,17 +496,27 @@ def backfill_embeddings(project: str = None, batch_size: int = 20) -> dict:
                 {"$set": {"embed_failed": True, "embed_error": "empty dialogue"}},
             )
             failed += 1
-            continue
-        embedding = _embed(dialogue)
-        if embedding is None:
-            col.update_one(
-                {"_id": doc["_id"]},
-                {"$set": {"embed_failed": True, "embed_error": "embedding returned None after retries"}},
-            )
-            failed += 1
-            continue
-        col.update_one({"_id": doc["_id"]}, {"$set": {"embedding": embedding}})
-        backfilled += 1
+        else:
+            valid_docs.append(doc)
+
+    # Embed all valid dialogues in a single API call (openai provider supports batch input).
+    # Falls back to one-by-one for the local provider which doesn't batch.
+    if valid_docs:
+        if EMBED_PROVIDER == "openai":
+            embeddings = _embed_batch([d["dialogue"] for d in valid_docs])
+        else:
+            embeddings = [_embed(d["dialogue"]) for d in valid_docs]
+
+        for doc, embedding in zip(valid_docs, embeddings):
+            if embedding is None:
+                col.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"embed_failed": True, "embed_error": "embedding returned None after retries"}},
+                )
+                failed += 1
+            else:
+                col.update_one({"_id": doc["_id"]}, {"$set": {"embedding": embedding}})
+                backfilled += 1
 
     remaining = col.count_documents(query)
     return {"backfilled": backfilled, "failed": failed, "remaining": remaining}
