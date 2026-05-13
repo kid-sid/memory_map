@@ -229,6 +229,59 @@ def parse_retrieved_ids(output: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Regression comparison
+# ---------------------------------------------------------------------------
+
+def _load_latest_result(results_dir: pathlib.Path, exclude: str = "") -> tuple:
+    """Return (path, data) of the most recent result JSON, skipping `exclude` filename."""
+    for candidate in sorted(results_dir.glob("*.json"), reverse=True):
+        if candidate.name == exclude:
+            continue
+        try:
+            return candidate, json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None, None
+
+
+def _compare_results(baseline_path: pathlib.Path, baseline: dict,
+                     current: dict, threshold: float) -> bool:
+    """Print a metric delta table. Returns True if any primary metric regressed."""
+    b_agg = baseline["aggregate"]
+    c_agg = current["aggregate"]
+    k = current["config"]["k"]
+    primary = {"recall@1", "recall@3", f"recall@{k}"}
+
+    print(f"\nDelta vs {baseline_path.name}")
+    print("-" * 60)
+
+    has_regression = False
+    score_metrics = [m for m in sorted(c_agg) if not m.startswith("latency")]
+    for metric in score_metrics:
+        if metric not in b_agg:
+            continue
+        b_val, c_val = b_agg[metric], c_agg[metric]
+        delta = c_val - b_val
+        flag = ""
+        if metric in primary and delta < -threshold:
+            flag = "  *** REGRESSION ***"
+            has_regression = True
+        print(f"  {metric:<16}: {b_val:.3f} -> {c_val:.3f}  ({delta:+.3f}){flag}")
+
+    for metric in ["latency_mean_ms", "latency_p95_ms"]:
+        if metric in b_agg and metric in c_agg:
+            b_val, c_val = b_agg[metric], c_agg[metric]
+            print(f"  {metric:<16}: {b_val:.0f}ms -> {c_val:.0f}ms  ({c_val - b_val:+.0f}ms)")
+
+    print("-" * 60)
+    if has_regression:
+        print(f"REGRESSION DETECTED — primary metric(s) dropped > {threshold:.0%}")
+    else:
+        print("No regression detected.")
+    return has_regression
+
+
+# ---------------------------------------------------------------------------
 # Git metadata for result files
 # ---------------------------------------------------------------------------
 
@@ -250,7 +303,8 @@ def _git_info() -> dict:
 # Main benchmark
 # ---------------------------------------------------------------------------
 
-def run_benchmark(k: int, token_budget: int, verbose: bool, index_wait: int = 0):
+def run_benchmark(k: int, token_budget: int, verbose: bool, index_wait: int = 0,
+                  compare: bool = False, threshold: float = 0.05):
     col = history_store._get_collection()
     if col is None:
         print("ERROR: MEMORY_MAP_MONGO_URI is not set — cannot run benchmark.")
@@ -376,15 +430,30 @@ def run_benchmark(k: int, token_budget: int, verbose: bool, index_wait: int = 0)
     col.delete_many({"project": project})
     print(f"Cleaned up {len(SEED_CHUNKS)} benchmark chunks.")
 
+    # Regression comparison against the most recent previous result
+    if compare:
+        baseline_path, baseline = _load_latest_result(RESULTS_DIR, exclude=result_file.name)
+        if baseline is None:
+            print("\nNo previous result found to compare against.")
+        else:
+            regressed = _compare_results(baseline_path, baseline, result_data, threshold)
+            if regressed:
+                sys.exit(1)
+
     return agg
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="memory_map retrieval benchmark")
-    parser.add_argument("--k",           type=int, default=5,    help="Recall/Precision/nDCG cutoff (default: 5)")
-    parser.add_argument("--budget",      type=int, default=4000, help="Token budget for suggest_history (default: 4000)")
-    parser.add_argument("--index-wait",  type=int, default=0,    help="Seconds to wait after seeding for Atlas vector index sync (default: 0; use 20 when EMBED_PROVIDER=openai)")
-    parser.add_argument("--verbose",     action="store_true",    help="Print per-query breakdown")
+    parser.add_argument("--k",           type=int,   default=5,    help="Recall/Precision/nDCG cutoff (default: 5)")
+    parser.add_argument("--budget",      type=int,   default=4000, help="Token budget for suggest_history (default: 4000)")
+    parser.add_argument("--index-wait",  type=int,   default=0,    help="Seconds to wait after seeding for Atlas vector index sync (default: 0; use 20 when EMBED_PROVIDER=openai)")
+    parser.add_argument("--verbose",     action="store_true",       help="Print per-query breakdown")
+    parser.add_argument("--compare",     action="store_true",       help="Compare against the most recent previous result; exit 1 on regression")
+    parser.add_argument("--threshold",   type=float, default=0.05,  help="Absolute drop threshold for primary metrics before flagging a regression (default: 0.05)")
     args = parser.parse_args()
 
-    run_benchmark(k=args.k, token_budget=args.budget, verbose=args.verbose, index_wait=args.index_wait)
+    run_benchmark(
+        k=args.k, token_budget=args.budget, verbose=args.verbose,
+        index_wait=args.index_wait, compare=args.compare, threshold=args.threshold,
+    )

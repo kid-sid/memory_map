@@ -401,6 +401,41 @@ def test_suggest_history_recency_fallback_no_tags(tmp_path):
     assert "general" in result
 
 
+def test_suggest_history_relevant_chunk_ranked_before_recent(tmp_path):
+    """High-relevance chunk must appear before the more-recent but unrelated anchor in output.
+
+    Regression guard for the relevance-first sort introduced in commit c5c9133.
+    The relevant chunk gets a positive BM25/RRF score; the unrelated anchor gets
+    score 0.0 — so it must sort last.
+    """
+    project = str(tmp_path)
+
+    # Chunk 1 (older): strong auth + bug-fix signal matching the query
+    history_store.save_chunk(
+        project, "s1",
+        "user: fix JWT token expiry — users are logged out after 5 minutes\n"
+        "assistant: extended TTL from 300s to 3600s in auth.py and added "
+        "POST /auth/refresh for silent renewal",
+        ["auth", "bug-fix"],
+    )
+    # Chunk 2 (newer = anchor): unrelated deployment content, no auth signal
+    history_store.save_chunk(
+        project, "s2",
+        "user: deploy the frontend build to staging\n"
+        "assistant: pushed docker image, pipeline green",
+        ["deployment"],
+    )
+
+    result = suggest_history(project, "fix the jwt login token expiry auth issue", token_budget=2000)
+
+    assert "Relevant History" in result
+    auth_pos = result.find("auth.py")       # unique string from chunk 1
+    deploy_pos = result.find("docker image")  # unique string from chunk 2
+    assert auth_pos != -1, "auth chunk content missing from output"
+    assert deploy_pos != -1, "deployment chunk content missing from output"
+    assert auth_pos < deploy_pos, "relevant (auth) chunk must rank before unrelated (deployment) anchor"
+
+
 # ---------------------------------------------------------------------------
 # Journey 6: per-Q&A-pair saving
 # ---------------------------------------------------------------------------
