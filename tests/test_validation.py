@@ -126,3 +126,24 @@ def test_delete_memory_removes_timestamp(tmp_path):
     delete_memory(str(tmp_path), "stack")
     data = _read_memory(str(tmp_path))
     assert "_updated_stack" not in data
+
+
+def test_load_memory_tfidf_rare_term_ranks_above_generic(tmp_path):
+    # "portalocker" is a rare distinctive term; "project" is common to both entries
+    save_memory(str(tmp_path), "gotchas", "portalocker is required for file locking in this project")
+    save_memory(str(tmp_path), "stack", "FastAPI project with MongoDB and pytest")
+    result = load_memory(str(tmp_path), query="portalocker")
+    lines = [l for l in result.splitlines() if l.strip()]
+    # gotchas should appear before stack since portalocker is unique to it
+    gotchas_pos = next((i for i, l in enumerate(lines) if "gotchas" in l), None)
+    stack_pos = next((i for i, l in enumerate(lines) if "stack" in l), None)
+    assert gotchas_pos is not None, "gotchas entry missing from result"
+    assert stack_pos is None or gotchas_pos < stack_pos, "rare-term entry should rank above generic entry"
+
+
+def test_load_memory_tfidf_top_k_limits_results(tmp_path):
+    for i in range(15):
+        save_memory(str(tmp_path), f"key{i}", f"value about topic number {i}")
+    result = load_memory(str(tmp_path), query="value topic", top_k=5)
+    lines = [l for l in result.splitlines() if l.strip()]
+    assert len(lines) <= 5

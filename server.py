@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import re
+import math
 import datetime
 import tempfile
 
@@ -401,6 +402,48 @@ def _compress_memory(data: dict, level: int = 1) -> str:
     return "\n".join(lines)
 
 
+def _tfidf_rank(entries: dict, words: list, top_k: int = 10) -> dict:
+    """Rank memory entries by TF-IDF relevance to query words.
+
+    Uses smoothed IDF — log((N+1)/(df+1))+1 — so single-entry stores and
+    ubiquitous terms still produce meaningful scores. Returns an ordered dict
+    of the top_k entries with score > 0, highest score first.
+    """
+    if not entries or not words:
+        return entries
+
+    docs = {k: re.findall(r"[a-z0-9]+", f"{k} {v}".lower()) for k, v in entries.items()}
+    N = len(docs)
+
+    df: dict = {}
+    for tokens in docs.values():
+        for term in set(tokens):
+            df[term] = df.get(term, 0) + 1
+
+    scores: dict = {}
+    for key, tokens in docs.items():
+        total = len(tokens)
+        if not total:
+            scores[key] = 0.0
+            continue
+        tf_map: dict = {}
+        for t in tokens:
+            tf_map[t] = tf_map.get(t, 0) + 1
+        score = 0.0
+        for word in words:
+            tf = tf_map.get(word, 0) / total
+            idf = math.log((N + 1) / (df.get(word, 0) + 1)) + 1
+            score += tf * idf
+        scores[key] = score
+
+    ranked = sorted(
+        [(k, s) for k, s in scores.items() if s > 0],
+        key=lambda x: x[1],
+        reverse=True,
+    )[:top_k]
+    return {k: entries[k] for k, _ in ranked}
+
+
 # ---------------------------------------------------------------------------
 # Tools: Memory management
 # ---------------------------------------------------------------------------
@@ -425,11 +468,12 @@ def save_memory(project_path: str, key: str, content: str) -> str:
 
 
 @mcp.tool()
-def load_memory(project_path: str, query: str = "") -> str:
-    """Load saved memory for a project, optionally filtered by a keyword query.
+def load_memory(project_path: str, query: str = "", top_k: int = 10) -> str:
+    """Load saved memory for a project, optionally filtered by a TF-IDF query.
 
-    query: space-separated words; an entry is included if its key or value contains
-    any word (case-insensitive). Omit or pass "" to return all entries.
+    query: space-separated words ranked by TF-IDF relevance; returns the top_k
+    most relevant entries. Omit or pass "" to return all entries unranked.
+    top_k: maximum number of entries to return when query is set (default 10).
     """
     try:
         data = _read_memory(project_path)
@@ -437,16 +481,13 @@ def load_memory(project_path: str, query: str = "") -> str:
             return "no memory saved yet"
         level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
         if query.strip():
-            words = [w.lower() for w in query.split() if w]
+            words = re.findall(r"[a-z0-9]+", query.lower())
             system = {k: v for k, v in data.items() if k.startswith("_")}
-            matched = {
-                k: v for k, v in data.items()
-                if not k.startswith("_")
-                and any(w in k.lower() or w in str(v).lower() for w in words)
-            }
-            if not matched:
+            user_entries = {k: v for k, v in data.items() if not k.startswith("_")}
+            ranked = _tfidf_rank(user_entries, words, top_k)
+            if not ranked:
                 return "no matching memory entries"
-            data = {**system, **matched}
+            data = {**system, **ranked}
         return _compress_memory(data, level)
     except Exception as e:
         return f"error: {e}"
