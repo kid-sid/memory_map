@@ -28,6 +28,9 @@ DEFAULT_COMPRESSION = 1
 KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,100}$')
 MAX_ENTRY_KB = int(os.environ.get("MCP_MAX_ENTRY_KB", "10"))
 GIT_TIMEOUT = int(os.environ.get("MCP_GIT_TIMEOUT", "10"))
+HISTORY_MAX_TOKENS = int(os.environ.get("MCP_HISTORY_MAX_TOKENS", "50000"))
+HISTORY_SUMMARISE_N = int(os.environ.get("MCP_HISTORY_SUMMARISE_N", "10"))
+MEMORY_SIMILARITY_THRESHOLD = 0.7
 GLOBAL_MEMORY_FILE = pathlib.Path.home() / ".mcp_global_memory.json"
 MAX_LOCAL_DEPTH = 10  # hard cap on get_local_structure depth
 
@@ -452,6 +455,14 @@ def _tfidf_rank(entries: dict, words: list, top_k: int = 10) -> dict:
 # Tools: Memory management
 # ---------------------------------------------------------------------------
 
+def _word_jaccard(a: str, b: str) -> float:
+    """Word-level Jaccard similarity between two strings."""
+    ta = set(re.findall(r"[a-z0-9]+", a.lower()))
+    tb = set(re.findall(r"[a-z0-9]+", b.lower()))
+    union = ta | tb
+    return len(ta & tb) / len(union) if union else 0.0
+
+
 @mcp.tool()
 def save_memory(project_path: str, key: str, content: str) -> str:
     """Save or update a memory entry for a project. Use short keys (e.g. 'stack', 'architecture')."""
@@ -466,7 +477,16 @@ def save_memory(project_path: str, key: str, content: str) -> str:
         data[key] = content
         data[f"_updated_{key}"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         _write_memory(project_path, data)
-        return f"saved: {key}"
+
+        existing = {k: v for k, v in data.items() if not k.startswith("_") and k != key}
+        dupes = [(k, _word_jaccard(content, v)) for k, v in existing.items()]
+        dupes = sorted([(k, s) for k, s in dupes if s >= MEMORY_SIMILARITY_THRESHOLD], key=lambda x: -x[1])
+
+        result = f"saved: {key}"
+        if dupes:
+            dupe_str = ", ".join(f"'{k}' ({s:.2f})" for k, s in dupes)
+            result += f" | warning: similar to existing key(s): {dupe_str}"
+        return result
     except Exception as e:
         return f"error: {e}"
 
@@ -545,7 +565,17 @@ def save_history(project_path: str, summary: str, session_id: str = "", tags: st
             tag_list = history_store.extract_tags(summary)
         chunk_id = history_store.save_chunk(project_path, session_id[:8] if session_id else "", summary, tag_list)
         tag_str = ",".join(tag_list) if tag_list else "untagged"
-        return f"history saved: chunk {chunk_id} tags:[{tag_str}]"
+        result = f"history saved: chunk {chunk_id} tags:[{tag_str}]"
+
+        try:
+            total = history_store.get_total_tokens(project_path)
+            if total > HISTORY_MAX_TOKENS:
+                history_store.summarise_oldest_chunks(project_path, HISTORY_SUMMARISE_N)
+                result += " [auto-summarised: history over budget]"
+        except Exception:
+            pass
+
+        return result
     except Exception as e:
         return f"error: {e}"
 
@@ -656,16 +686,41 @@ def backfill_bm25_text(project_path: str = "", batch_size: int = 100) -> str:
 
 
 @mcp.tool()
-def suggest_history(project_path: str, user_message: str, token_budget: int = 2000) -> str:
+def summarise_history(project_path: str, n: int = 10) -> str:
+    """Collapse the n oldest history chunks into a single summary chunk.
+
+    Reduces storage and retrieval noise by merging old context into a compact
+    combined chunk with a type='summary' marker. Triggered automatically when
+    total tokens exceed MCP_HISTORY_MAX_TOKENS (default 50000); call manually
+    to compact immediately.
+    """
+    try:
+        result = history_store.summarise_oldest_chunks(project_path, n)
+        if "error" in result:
+            return f"error: {result['error']}"
+        if "reason" in result:
+            return f"skipped: {result['reason']}"
+        return (
+            f"summarised: {result['summarised']} chunks into {result['new_chunk_id']}, "
+            f"tokens_before: {result['tokens_before']}, tokens_after: {result['tokens_after']}"
+        )
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def suggest_history(project_path: str, user_message: str, token_budget: int = 2000, diversity: float = 0.3) -> str:
     """Retrieve the most relevant history chunks for the current task.
 
     Selection logic:
       1. Vector search (if EMBED_PROVIDER configured) + BM25/tag scoring are run
          concurrently and merged with Reciprocal Rank Fusion (RRF, k=60).  Chunks
          appearing in both lists outrank chunks in only one.
-      2. Anchor (most recent chunk) is guaranteed to be included for session
+      2. MMR re-ranking (diversity 0.0–1.0, default 0.3) penalises redundant
+         chunks so the selected set covers more distinct topics.
+      3. Anchor (most recent chunk) is guaranteed to be included for session
          continuity; it is BM25-scored and ranked like any other candidate.
-      3. Remaining token budget is filled with the most recent unselected chunks.
+      4. Remaining token budget is filled with the most recent unselected chunks.
 
     When no EMBED_PROVIDER is configured, only BM25+tag scoring is used and RRF
     is applied over the single list (preserving BM25 order).
@@ -708,6 +763,12 @@ def suggest_history(project_path: str, user_message: str, token_budget: int = 20
         # gets a contribution from each rank, so it outranks a chunk in only one.
         active_lists = [lst for lst in [vector_ranked, bm25_ranked] if lst]
         merged = history_store.rrf_merge(active_lists) if active_lists else []
+
+        # MMR re-ranking: penalise chunks similar to already-selected ones so the
+        # result set spans more distinct topics (skipped when diversity=0.0).
+        if diversity > 0.0 and len(merged) > 1:
+            merged = history_store.mmr_rerank(merged, diversity)
+
         ranked = [(entry, rrf_score, source) for rrf_score, entry, source in merged]
 
         # Add ranked candidates (high score first) within budget.

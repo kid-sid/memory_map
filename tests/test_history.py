@@ -342,3 +342,107 @@ def test_rrf_merge_k_affects_scores_not_order():
         merged = history_store.rrf_merge([ranked], k=k)
         ids = [e["id"] for _, e, _ in merged]
         assert ids == ["1", "2"], f"order changed with k={k}"
+
+
+# ---------------------------------------------------------------------------
+# mmr_rerank unit tests
+# ---------------------------------------------------------------------------
+
+def _me(eid: str, tags: list, text: str) -> dict:
+    return {"id": eid, "tags": tags, "preview": text, "bm25_text": text}
+
+
+def test_mmr_zero_diversity_preserves_order():
+    """diversity=0.0 disables MMR — original order must be unchanged."""
+    e1 = _me("1", ["auth"], "fix login token expiry jwt")
+    e2 = _me("2", ["auth"], "fix login token expiry jwt")
+    merged = [(0.9, e1, "bm25"), (0.8, e2, "bm25")]
+    result = history_store.mmr_rerank(merged, diversity=0.0)
+    assert [e["id"] for _, e, _ in result] == ["1", "2"]
+
+
+def test_mmr_selects_diverse_over_duplicate():
+    """A near-duplicate second chunk should be ranked below a diverse third chunk."""
+    e1 = _me("1", ["auth", "bug-fix"], "fix login token expiry jwt session")
+    e2 = _me("2", ["auth", "bug-fix"], "fix login token expiry jwt session")   # near-duplicate of e1
+    e3 = _me("3", ["database"], "postgres migration alter table schema index")   # diverse
+
+    # e1 > e2 > e3 by rrf_score, but e3 is diverse so MMR should promote it above e2
+    merged = [(0.9, e1, "bm25"), (0.7, e2, "bm25"), (0.5, e3, "bm25")]
+    result = history_store.mmr_rerank(merged, diversity=0.5)
+    ids = [e["id"] for _, e, _ in result]
+
+    assert ids[0] == "1", "top relevance chunk should still be first"
+    assert ids[1] == "3", "diverse chunk should beat near-duplicate of first"
+
+
+def test_mmr_single_candidate_unchanged():
+    e1 = _me("1", ["auth"], "login fix")
+    merged = [(0.9, e1, "bm25")]
+    result = history_store.mmr_rerank(merged, diversity=0.5)
+    assert len(result) == 1 and result[0][1]["id"] == "1"
+
+
+def test_mmr_empty_input_unchanged():
+    assert history_store.mmr_rerank([], diversity=0.5) == []
+
+
+# ---------------------------------------------------------------------------
+# summarise_oldest_chunks / get_total_tokens unit tests (require MongoDB)
+# ---------------------------------------------------------------------------
+
+def test_get_total_tokens_empty(tmp_path):
+    assert history_store.get_total_tokens(str(tmp_path)) == 0
+
+
+def test_get_total_tokens_after_saves(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    history_store.save_chunk(project, "s", "a" * 400, [])   # 100 tokens
+    history_store.save_chunk(project, "s", "b" * 400, [])   # 100 tokens
+    total = history_store.get_total_tokens(project)
+    assert total == 200
+
+
+def test_summarise_oldest_chunks_reduces_count(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    for i in range(5):
+        history_store.save_chunk(project, "s", f"user: task {i}\nassistant: done {i}", [])
+    result = history_store.summarise_oldest_chunks(project, n=3)
+    assert result["summarised"] == 3
+    assert "new_chunk_id" in result
+    # 5 original - 3 deleted + 1 summary = 3 total
+    index = history_store.load_index(project, last_n=20)
+    assert len(index) == 3
+
+
+def test_summarise_oldest_chunks_too_few(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    history_store.save_chunk(project, "s", "only one chunk", [])
+    result = history_store.summarise_oldest_chunks(project, n=5)
+    assert result["summarised"] == 0
+    assert "reason" in result
+
+
+def test_summarise_history_mcp_tool(tmp_path, requires_mongodb):
+    from server import summarise_history
+    project = str(tmp_path)
+    for i in range(4):
+        history_store.save_chunk(project, "s", f"user: task {i}\nassistant: done {i}", [])
+    result = summarise_history(project, n=3)
+    assert result.startswith("summarised: 3")
+    assert "tokens_before" in result
+
+
+def test_summarise_skips_existing_summaries(tmp_path, requires_mongodb):
+    """summarise_oldest_chunks should not re-summarise a summary chunk."""
+    project = str(tmp_path)
+    for i in range(5):
+        history_store.save_chunk(project, "s", f"user: task {i}\nassistant: done {i}", [])
+    # First summarise
+    r1 = history_store.summarise_oldest_chunks(project, n=3)
+    assert r1["summarised"] == 3
+    # Second summarise should collapse the 2 remaining originals (not the summary)
+    r2 = history_store.summarise_oldest_chunks(project, n=5)
+    index = history_store.load_index(project, last_n=20)
+    # summary from r1 + summary from r2 = 2 chunks
+    assert len(index) == 2

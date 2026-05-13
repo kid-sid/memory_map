@@ -147,3 +147,33 @@ def test_load_memory_tfidf_top_k_limits_results(tmp_path):
     result = load_memory(str(tmp_path), query="value topic", top_k=5)
     lines = [l for l in result.splitlines() if l.strip()]
     assert len(lines) <= 5
+
+
+# ---------------------------------------------------------------------------
+# save_memory similarity-warning tests (#36)
+# ---------------------------------------------------------------------------
+
+def test_save_memory_warns_on_similar_value(tmp_path):
+    # "FastAPI MongoDB Redis" and "FastAPI MongoDB Redis caching" share 3/4 words → Jaccard 0.75
+    save_memory(str(tmp_path), "stack", "FastAPI MongoDB Redis")
+    result = save_memory(str(tmp_path), "tech_stack", "FastAPI MongoDB Redis caching")
+    assert "saved: tech_stack" in result
+    assert "warning" in result
+    assert "stack" in result
+
+
+def test_save_memory_no_warning_for_distinct_value(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI with MongoDB")
+    result = save_memory(str(tmp_path), "gotchas", "portalocker required for file locking on windows")
+    assert "warning" not in result
+
+
+def test_save_memory_no_warning_on_first_entry(tmp_path):
+    result = save_memory(str(tmp_path), "stack", "FastAPI with MongoDB")
+    assert "warning" not in result
+
+
+def test_save_memory_no_self_warning_on_update(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI with MongoDB")
+    result = save_memory(str(tmp_path), "stack", "FastAPI with MongoDB and Redis")
+    assert "warning" not in result

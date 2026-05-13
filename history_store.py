@@ -697,3 +697,109 @@ def rrf_merge(ranked_lists: list, k: int = 60) -> list:
         source_label = "+".join(sorted(sources[eid]))
         result.append((rrf_score, entries[eid], source_label))
     return result
+
+
+def mmr_rerank(merged: list, diversity: float = 0.3) -> list:
+    """Maximal Marginal Relevance re-ranking over RRF-merged candidates.
+
+    merged: list of (rrf_score, entry, source_label) from rrf_merge, best-first.
+    diversity: 0.0 = pure relevance order (no re-ranking); 1.0 = pure diversity.
+    Returns re-ranked list in the same (rrf_score, entry, source_label) format.
+
+    Similarity between two chunks is the average of tag Jaccard and token Jaccard
+    on bm25_text (or preview for older chunks) — no vector embeddings required.
+    """
+    if not merged or diversity <= 0.0:
+        return merged
+
+    def _tag_jaccard(a: dict, b: dict) -> float:
+        ta, tb = set(a.get("tags", [])), set(b.get("tags", []))
+        union = ta | tb
+        return len(ta & tb) / len(union) if union else 0.0
+
+    def _text_jaccard(a: dict, b: dict) -> float:
+        def _tok(e):
+            t = e.get("bm25_text", e.get("preview", ""))
+            return set(re.sub(r"[^\w]", " ", t.lower()).split())
+        ta, tb = _tok(a), _tok(b)
+        union = ta | tb
+        return len(ta & tb) / len(union) if union else 0.0
+
+    def _sim(a: dict, b: dict) -> float:
+        return 0.5 * _tag_jaccard(a, b) + 0.5 * _text_jaccard(a, b)
+
+    remaining = list(merged)
+    selected = []
+
+    while remaining:
+        if not selected:
+            chosen = remaining[0]
+        else:
+            best_mmr = None
+            chosen = None
+            for candidate in remaining:
+                rrf_score = candidate[0]
+                entry = candidate[1]
+                max_sim = max(_sim(entry, s[1]) for s in selected)
+                mmr = (1.0 - diversity) * rrf_score - diversity * max_sim
+                if chosen is None or mmr > best_mmr:
+                    best_mmr = mmr
+                    chosen = candidate
+        selected.append(chosen)
+        remaining.remove(chosen)
+
+    return selected
+
+
+def get_total_tokens(project: str) -> int:
+    """Return total token count across all chunks for a project (fast aggregation)."""
+    col = _get_collection()
+    if col is None:
+        return 0
+    pipeline = [
+        {"$match": {"project": project}},
+        {"$group": {"_id": None, "total": {"$sum": "$stats.tokens"}}},
+    ]
+    result = list(col.aggregate(pipeline))
+    return int(result[0]["total"]) if result else 0
+
+
+def summarise_oldest_chunks(project: str, n: int = 10) -> dict:
+    """Collapse the n oldest non-summary chunks into a single summary chunk.
+
+    Concatenates their dialogues chronologically, saves as a new chunk with
+    type='summary', then deletes the source chunks. Returns stats dict.
+    """
+    col = _get_collection()
+    if col is None:
+        return {"error": "MongoDB not configured"}
+
+    cursor = col.find(
+        {"project": project, "type": {"$ne": "summary"}},
+        {"_id": 1, "dialogue": 1, "timestamp": 1, "tags": 1, "stats": 1},
+    ).sort("timestamp", 1).limit(n)
+    chunks = list(cursor)
+
+    if len(chunks) < 2:
+        return {"summarised": 0, "reason": "fewer than 2 non-summary chunks available"}
+
+    tokens_before = sum(c.get("stats", {}).get("tokens", 0) for c in chunks)
+    start_ts = chunks[0].get("timestamp", "")
+    end_ts = chunks[-1].get("timestamp", "")
+    all_tags = sorted({tag for c in chunks for tag in c.get("tags", [])})
+
+    combined = "\n\n---\n\n".join(c.get("dialogue", "") for c in chunks)
+    summary_text = f"[Summary of {len(chunks)} chunks from {start_ts} to {end_ts}]\n\n{combined}"
+
+    chunk_id = save_chunk(project, "auto-summary", summary_text, all_tags, embed=False)
+
+    from bson import ObjectId
+    col.update_one({"_id": ObjectId(chunk_id)}, {"$set": {"type": "summary"}})
+    col.delete_many({"_id": {"$in": [c["_id"] for c in chunks]}})
+
+    return {
+        "summarised": len(chunks),
+        "new_chunk_id": chunk_id,
+        "tokens_before": tokens_before,
+        "tokens_after": compute_stats(summary_text)["tokens"],
+    }
