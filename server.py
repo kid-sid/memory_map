@@ -14,6 +14,7 @@ import pathspec
 
 import portalocker
 import history_store
+from redact import redact_secrets
 
 mcp = FastMCP("file-structure")
 
@@ -470,6 +471,7 @@ def save_memory(project_path: str, key: str, content: str) -> str:
         return "error: keys starting with '_' are reserved for system use"
     if not KEY_PATTERN.match(key):
         return "error: key must be 1-100 chars using only letters, digits, _ or -"
+    content = redact_secrets(content)
     if len(content.encode("utf-8")) > MAX_ENTRY_KB * 1024:
         return f"error: content exceeds {MAX_ENTRY_KB}KB limit (set MCP_MAX_ENTRY_KB to override)"
     try:
@@ -560,6 +562,7 @@ def save_history(project_path: str, summary: str, session_id: str = "", tags: st
     If omitted, tags are extracted from summary content by keyword matching.
     """
     try:
+        summary = redact_secrets(summary)
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
         if not tag_list:
             tag_list = history_store.extract_tags(summary)

@@ -109,3 +109,29 @@ def test_no_false_positive_short_sk():
 
 def test_empty_string():
     assert redact_secrets("") == ""
+
+
+def test_no_false_positive_token_in_prose():
+    # "token" without an = assignment should not be touched
+    text = "the token of appreciation"
+    assert redact_secrets(text) == text
+
+
+def test_no_false_positive_code_variable_name():
+    # "secret" as part of a variable name with no key=value pattern
+    text = "secret_manager = SecretManager()"
+    assert redact_secrets(text) == text
+
+
+def test_env_style_openai_key():
+    # .env-style line — generic assignment AND sk-proj key both present
+    text = "OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUvWx123456"
+    result = redact_secrets(text)
+    assert "sk-proj-AbCdEfGhIjKlMnOpQrStUvWx123456" not in result
+    assert "[REDACTED]" in result
+
+
+def test_idempotent_env_style():
+    text = "OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUvWx123456"
+    once = redact_secrets(text)
+    assert redact_secrets(once) == once
