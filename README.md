@@ -100,7 +100,7 @@ That's all. The server creates the database and collection automatically on firs
 | Data files | `C:\Program Files\MongoDB\Server\<version>\data\` |
 | Log files | `C:\Program Files\MongoDB\Server\<version>\log\` |
 | Database | `memory_map` (created automatically) |
-| Collection | `memory_map.history` (created automatically) |
+| Collections | `memory_map.history` and `memory_map.memory` (created automatically) |
 
 ---
 
@@ -130,7 +130,7 @@ Open Claude Code and run:
 /mcp
 ```
 
-You should see `memory_map` listed with 20 tools. If it's not there, double-check the path in Step 3.
+You should see `memory_map` listed with 21 tools. If it's not there, double-check the path in Step 3.
 
 ---
 
@@ -231,9 +231,9 @@ When you open a project that has `CLAUDE.md`:
 2. Calls `suggest_history(project_path, first_user_message)` — scores history chunks by relevance to your first message and returns the best fit within a token budget
 3. Has full project context before touching a single file
 
-### Where history is stored
+### Where history and memory are stored
 
-History lives in MongoDB (`memory_map.history` collection), filtered by the `project` field (the `cwd`). Each project gets its own isolated namespace — nothing bleeds between projects. Key-value memory is stored in `.mcp_memory.json` per project (file-based, no MongoDB needed).
+History lives in MongoDB (`memory_map.history` collection) and key-value memory in MongoDB (`memory_map.memory` collection), both filtered by the `project` field (the `cwd`). Each project gets its own isolated namespace — nothing bleeds between projects. When MongoDB is not configured, key-value memory falls back to `.mcp_memory.json` per project.
 
 ### Per-project memory keys
 
@@ -410,10 +410,11 @@ This means Claude can surface a relevant chunk from 3 months ago if it matches y
 
 **Storage backends:**
 
-| Backend | When used | Capacity |
+| Store | Backend | When used |
 |---|---|---|
-| MongoDB | `MEMORY_MAP_MONGO_URI` is set | Unlimited, indexed by tag and timestamp |
-| JSON file (`.mcp_history.json`) | No URI configured | Up to 100 chunks per project |
+| Conversation history | MongoDB `memory_map.history` | `MEMORY_MAP_MONGO_URI` is set (required) |
+| Key-value memory | MongoDB `memory_map.memory` | `MEMORY_MAP_MONGO_URI` is set (primary) |
+| Key-value memory | `.mcp_memory.json` per project | MongoDB not configured (fallback) |
 
 ---
 
@@ -473,7 +474,8 @@ Useful when conversations get long, before switching topics, or before closing a
 | `save_memory` | `project_path`, `key`, `content` | Save or update a context entry. Returns a warning if the new value is semantically similar (word Jaccard ≥ 0.7) to an existing entry — the save always succeeds |
 | `load_memory` | `project_path`, `query=""`, `top_k=10` | Load saved context (compressed). Pass a query to get TF-IDF ranked results |
 | `delete_memory` | `project_path`, `key` | Remove a specific entry |
-| `set_compression` | `project_path`, `level` | Set compression level (0, 1, or 2) |
+| `set_compression` | `project_path`, `level` | Set compression level (0, 1, or 2) — persisted in MongoDB when configured |
+| `migrate_memory_to_mongo` | `project_path`, `dry_run=False`, `force=False` | One-time migration of `.mcp_memory.json` into MongoDB. Pass `project_path="__global__"` to migrate global memory. Use `dry_run=True` to preview, `force=True` to overwrite existing entries |
 
 ### Conversation History
 
@@ -504,7 +506,8 @@ Useful when conversations get long, before switching topics, or before closing a
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_MAP_MONGO_URI` | _(unset)_ | MongoDB connection string. Required for all history tools. |
+| `MEMORY_MAP_MONGO_URI` | _(unset)_ | MongoDB connection string. Required for all history tools. Primary store for key-value memory when set. |
+| `MEMORY_MAP_AUTO_MIGRATE` | `1` | When `1` (default), automatically migrates `.mcp_memory.json` into MongoDB on the first `save_memory` or `load_memory` call for each project. Set to `0` to disable. |
 | `MEMORY_MAP_EMBED_PROVIDER` | _(unset)_ | `openai` — vector search via OpenAI `text-embedding-3-small` (1536 dims); `local` — vector search via `sentence-transformers all-MiniLM-L6-v2` (384 dims, CPU, no API key, ~90 MB first-run download); `atlas` — Atlas autoEmbed (Voyage-4). BM25-only if unset. |
 | `MEMORY_MAP_MIN_VECTOR_SCORE` | `0.65` | Minimum Atlas vectorSearchScore threshold (below = noise). |
 | `OPENAI_API_KEY` | _(unset)_ | Required when `MEMORY_MAP_EMBED_PROVIDER=openai`. |
@@ -527,7 +530,7 @@ Useful when conversations get long, before switching topics, or before closing a
 python -m pytest tests/ -v
 ```
 
-139 tests across 7 files:
+195 tests across 8 files:
 
 | File | Coverage |
 |---|---|
@@ -537,7 +540,8 @@ python -m pytest tests/ -v
 | `test_multi_project.py` | Cross-project tools, global memory |
 | `test_new_features.py` | load_memory query filtering, max_depth in multi-project tools, gitignore handling |
 | `test_validation.py` | Key validation, size limits, corrupted JSON recovery, TF-IDF ranking, save_memory similarity warning |
-| `test_client.py` | MCP client connectivity |
+| `test_memory_mongo.py` | MongoDB-backed save/load/delete, stale warning, TF-IDF, similarity warning |
+| `test_mongo_features.py` | MongoDB compression, global memory, migration tool, auto-migrate |
 
 Tests requiring a live MongoDB connection use the `requires_mongodb` fixture and are skipped automatically when `MEMORY_MAP_MONGO_URI` is unset.
 
