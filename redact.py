@@ -1,6 +1,10 @@
 """Secret redaction utilities."""
 
+import logging
+import os
 import re
+
+logger = logging.getLogger(__name__)
 
 # MongoDB URI: mongodb[+srv]://user:PASSWORD@host — redact the password group
 _MONGO_RE = re.compile(r'(mongodb(?:\+srv)?://[^:]+:)([^@]+)(@)')
@@ -22,10 +26,30 @@ _ASSIGN_RE = re.compile(
 )
 
 
+def _load_user_patterns() -> list:
+    """Compile patterns from MCP_REDACT_PATTERNS (|-delimited). Invalid entries are skipped."""
+    raw = os.environ.get("MCP_REDACT_PATTERNS", "")
+    compiled = []
+    for part in raw.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            compiled.append(re.compile(part))
+        except re.error as exc:
+            logger.warning("memory_map: invalid MCP_REDACT_PATTERNS entry %r — skipped (%s)", part, exc)
+    return compiled
+
+
+_USER_PATTERNS: list = _load_user_patterns()
+
+
 def redact_secrets(text: str) -> str:
     """Replace known secret patterns with [REDACTED]. Idempotent."""
     text = _MONGO_RE.sub(r'\1[REDACTED]\3', text)
     for pattern in _PATTERNS:
         text = pattern.sub('[REDACTED]', text)
     text = _ASSIGN_RE.sub(r'\1=[REDACTED]', text)
+    for pattern in _USER_PATTERNS:
+        text = pattern.sub('[REDACTED]', text)
     return text

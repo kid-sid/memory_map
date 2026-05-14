@@ -510,6 +510,7 @@ Useful when conversations get long, before switching topics, or before closing a
 | `OPENAI_API_KEY` | _(unset)_ | Required when `MEMORY_MAP_EMBED_PROVIDER=openai`. |
 | `GITHUB_TOKEN` | _(unset)_ | GitHub token for private repos / higher rate limits |
 | `MCP_MAX_ENTRY_KB` | `10` | Max size per memory entry in KB |
+| `MCP_REDACT_PATTERNS` | _(unset)_ | `\|`-delimited list of extra regex patterns to redact (e.g. `MYCO-[A-Z0-9]{32}\|Bearer [A-Za-z0-9._-]+`). Invalid patterns are logged and skipped. |
 | `MCP_GIT_TIMEOUT` | `10` | Timeout in seconds for git commands |
 | `MCP_HISTORY_MAX_TOKENS` | `50000` | Total token threshold that triggers auto-summarisation in `save_history` |
 | `MCP_HISTORY_SUMMARISE_N` | `10` | Number of oldest chunks to collapse per auto-summarise pass |

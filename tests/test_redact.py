@@ -1,5 +1,6 @@
+import os
 import pytest
-from redact import redact_secrets
+from redact import redact_secrets, _load_user_patterns
 
 
 # --- Pattern coverage ---
@@ -135,3 +136,33 @@ def test_idempotent_env_style():
     text = "OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUvWx123456"
     once = redact_secrets(text)
     assert redact_secrets(once) == once
+
+
+# --- MCP_REDACT_PATTERNS (user-defined patterns) ---
+
+def test_user_patterns_compiled(monkeypatch):
+    monkeypatch.setenv("MCP_REDACT_PATTERNS", r"MYCO-[A-Z0-9]{8}")
+    patterns = _load_user_patterns()
+    assert len(patterns) == 1
+    assert patterns[0].pattern == r"MYCO-[A-Z0-9]{8}"
+
+
+def test_user_patterns_multiple(monkeypatch):
+    monkeypatch.setenv("MCP_REDACT_PATTERNS", r"MYCO-[A-Z0-9]{8}|Bearer [A-Za-z0-9._-]+")
+    patterns = _load_user_patterns()
+    assert len(patterns) == 2
+
+
+def test_user_patterns_invalid_skipped(monkeypatch, caplog):
+    import logging
+    monkeypatch.setenv("MCP_REDACT_PATTERNS", r"GOOD-[A-Z]+|[invalid")
+    with caplog.at_level(logging.WARNING, logger="redact"):
+        patterns = _load_user_patterns()
+    assert len(patterns) == 1  # only valid pattern compiled
+    assert "invalid" in caplog.text.lower() or "skipped" in caplog.text.lower()
+
+
+def test_user_patterns_empty_env(monkeypatch):
+    monkeypatch.delenv("MCP_REDACT_PATTERNS", raising=False)
+    patterns = _load_user_patterns()
+    assert patterns == []
