@@ -24,6 +24,7 @@ import uuid
 from datetime import datetime
 
 import history_store
+from redact import redact_secrets
 
 MAX_TURN_CHARS   = int(os.environ.get("MCP_MAX_TURN_CHARS",  "3000"))
 MAX_CHUNK_CHARS  = int(os.environ.get("MCP_MAX_CHUNK_CHARS", "4000"))
@@ -225,7 +226,7 @@ def main():
     all_tags = set()
 
     for pair in pairs:
-        dialogue = f"user: {pair['user']}\nassistant: {pair['assistant']}"
+        dialogue = redact_secrets(f"user: {pair['user']}\nassistant: {pair['assistant']}")
         tags = history_store.extract_tags(dialogue)
         all_tags.update(tags)
         chunks = split_into_chunks(dialogue)
