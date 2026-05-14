@@ -76,7 +76,7 @@ def test_load_memory_query_multiple_keywords_any_match(tmp_path):
 # — max_depth (issue #4)
 # ---------------------------------------------------------------------------
 
-def test_list_projects_depth1_misses_nested(tmp_path):
+def test_list_projects_depth1_misses_nested(tmp_path, requires_file_mode):
     sub = tmp_path / "sub"
     sub.mkdir()
     setup_project(sub, "deep-proj", {"stack": "Python"})
@@ -85,7 +85,7 @@ def test_list_projects_depth1_misses_nested(tmp_path):
     assert "deep-proj" not in names
 
 
-def test_list_projects_depth2_finds_nested(tmp_path):
+def test_list_projects_depth2_finds_nested(tmp_path, requires_file_mode):
     sub = tmp_path / "sub"
     sub.mkdir()
     setup_project(sub, "deep-proj", {"stack": "Python"})
@@ -94,7 +94,7 @@ def test_list_projects_depth2_finds_nested(tmp_path):
     assert "deep-proj" in names
 
 
-def test_list_projects_depth1_still_finds_direct_children(tmp_path):
+def test_list_projects_depth1_still_finds_direct_children(tmp_path, requires_file_mode):
     setup_project(tmp_path, "proj-a", {"stack": "Python"})
     result = json.loads(list_projects(str(tmp_path), max_depth=1))
     names = [p["name"] for p in result]
@@ -106,7 +106,7 @@ def test_list_projects_max_depth_capped_at_5(tmp_path):
     assert isinstance(result, list)
 
 
-def test_load_cross_project_depth2_finds_nested(tmp_path):
+def test_load_cross_project_depth2_finds_nested(tmp_path, requires_file_mode):
     sub = tmp_path / "sub"
     sub.mkdir()
     setup_project(sub, "deep-proj", {"stack": "Rust"})
@@ -114,7 +114,7 @@ def test_load_cross_project_depth2_finds_nested(tmp_path):
     assert "Rust" in result
 
 
-def test_load_cross_project_depth1_misses_nested(tmp_path):
+def test_load_cross_project_depth1_misses_nested(tmp_path, requires_file_mode):
     sub = tmp_path / "sub"
     sub.mkdir()
     setup_project(sub, "deep-proj", {"stack": "Rust"})
@@ -122,7 +122,7 @@ def test_load_cross_project_depth1_misses_nested(tmp_path):
     assert "Rust" not in result
 
 
-def test_search_across_projects_depth2_finds_nested(tmp_path):
+def test_search_across_projects_depth2_finds_nested(tmp_path, requires_file_mode):
     sub = tmp_path / "sub"
     sub.mkdir()
     setup_project(sub, "deep-proj", {"stack": "Elixir Phoenix"})
@@ -130,7 +130,7 @@ def test_search_across_projects_depth2_finds_nested(tmp_path):
     assert "deep-proj" in result
 
 
-def test_search_across_projects_depth1_misses_nested(tmp_path):
+def test_search_across_projects_depth1_misses_nested(tmp_path, requires_file_mode):
     sub = tmp_path / "sub"
     sub.mkdir()
     setup_project(sub, "deep-proj", {"stack": "Elixir Phoenix"})

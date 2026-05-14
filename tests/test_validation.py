@@ -55,6 +55,13 @@ def test_corrupted_memory_json_recovery(tmp_path):
     result = load_memory(str(tmp_path))
     assert "error" not in result
     assert "no memory saved yet" in result
+
+
+def test_corrupted_memory_json_creates_backup(tmp_path):
+    # Tests _load_json_safe directly — always file-based, regardless of MongoDB.
+    mem_file = tmp_path / ".mcp_memory.json"
+    mem_file.write_text("{ invalid json !!!", encoding="utf-8")
+    _read_memory(str(tmp_path))
     bak_files = list(tmp_path.glob(".mcp_memory.json.bak.*"))
     assert len(bak_files) == 1
 
@@ -94,7 +101,7 @@ def test_delete_nonexistent_key(tmp_path):
     assert "not found" in result
 
 
-def test_save_memory_writes_timestamp(tmp_path):
+def test_save_memory_writes_timestamp(tmp_path, requires_file_mode):
     save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
     data = _read_memory(str(tmp_path))
     assert "_updated_stack" in data
@@ -103,7 +110,7 @@ def test_save_memory_writes_timestamp(tmp_path):
     assert age.total_seconds() < 5
 
 
-def test_load_memory_stale_warning(tmp_path):
+def test_load_memory_stale_warning(tmp_path, requires_file_mode):
     save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
     # Back-date the timestamp by 31 days to simulate a stale entry
     data = _read_memory(str(tmp_path))

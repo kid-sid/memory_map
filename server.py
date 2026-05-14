@@ -336,6 +336,30 @@ def get_git_history(path: str, count: int = 5) -> str:
 # Memory helpers
 # ---------------------------------------------------------------------------
 
+# MongoDB memory collection — lazy singleton, shares the same MongoClient as
+# the history collection.  Returns None when MongoDB is unconfigured.
+_memory_col = None
+_memory_col_init_done = False
+
+
+def _memory_collection():
+    global _memory_col, _memory_col_init_done
+    if _memory_col_init_done:
+        return _memory_col
+    _memory_col_init_done = True
+    try:
+        history_col = history_store._get_collection()
+        if history_col is None:
+            return None
+        col = history_col.database["memory"]
+        col.create_index([("project", 1), ("key", 1)], unique=True, background=True)
+        col.create_index([("updated_at", -1)], background=True)
+        _memory_col = col
+    except Exception:
+        pass  # MongoDB unavailable — callers fall back to file
+    return _memory_col
+
+
 def _memory_path(project_path: str) -> pathlib.Path:
     return _validate_project_path(project_path) / MEMORY_FILE
 
@@ -368,7 +392,7 @@ def _abbreviate(text: str) -> str:
     return result
 
 
-def _compress_memory(data: dict, level: int = 1) -> str:
+def _compress_memory(data: dict, level: int = 1, updated_at: dict | None = None) -> str:
     """Compress memory dict into LLM-optimized text.
 
     Level 0 (raw):     key: value
@@ -376,6 +400,8 @@ def _compress_memory(data: dict, level: int = 1) -> str:
     Level 2 (dense):   [shortened_key] abbreviated_value
 
     Entries not updated in >30 days are annotated with a stale warning.
+    updated_at: optional side-map {key: iso_timestamp} used by the MongoDB
+    path (where timestamps live on the doc, not in data as _updated_<key>).
     """
     entries = {k: v for k, v in data.items() if not k.startswith("_")}
 
@@ -386,7 +412,7 @@ def _compress_memory(data: dict, level: int = 1) -> str:
     _stale_days = 30
 
     def _stale_suffix(key: str) -> str:
-        ts_str = data.get(f"_updated_{key}")
+        ts_str = (updated_at or {}).get(key) or data.get(f"_updated_{key}")
         if not ts_str:
             return ""
         try:
@@ -475,12 +501,24 @@ def save_memory(project_path: str, key: str, content: str) -> str:
     if len(content.encode("utf-8")) > MAX_ENTRY_KB * 1024:
         return f"error: content exceeds {MAX_ENTRY_KB}KB limit (set MCP_MAX_ENTRY_KB to override)"
     try:
-        data = _read_memory(project_path)
-        data[key] = content
-        data[f"_updated_{key}"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        _write_memory(project_path, data)
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        col = _memory_collection()
+        if col is not None:
+            project = str(_validate_project_path(project_path))
+            col.update_one(
+                {"project": project, "key": key},
+                {"$set": {"value": content, "updated_at": now_str, "schema_version": 1}},
+                upsert=True,
+            )
+            other_docs = list(col.find({"project": project, "key": {"$ne": key}}, {"key": 1, "value": 1}))
+            existing = {d["key"]: d["value"] for d in other_docs}
+        else:
+            data = _read_memory(project_path)
+            data[key] = content
+            data[f"_updated_{key}"] = now_str
+            _write_memory(project_path, data)
+            existing = {k: v for k, v in data.items() if not k.startswith("_") and k != key}
 
-        existing = {k: v for k, v in data.items() if not k.startswith("_") and k != key}
         dupes = [(k, _word_jaccard(content, v)) for k, v in existing.items()]
         dupes = sorted([(k, s) for k, s in dupes if s >= MEMORY_SIMILARITY_THRESHOLD], key=lambda x: -x[1])
 
@@ -502,19 +540,37 @@ def load_memory(project_path: str, query: str = "", top_k: int = 10) -> str:
     top_k: maximum number of entries to return when query is set (default 10).
     """
     try:
-        data = _read_memory(project_path)
-        if not any(not k.startswith("_") for k in data):
-            return "no memory saved yet"
-        level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
-        if query.strip():
-            words = re.findall(r"[a-z0-9]+", query.lower())
-            system = {k: v for k, v in data.items() if k.startswith("_")}
-            user_entries = {k: v for k, v in data.items() if not k.startswith("_")}
-            ranked = _tfidf_rank(user_entries, words, top_k)
-            if not ranked:
-                return "no matching memory entries"
-            data = {**system, **ranked}
-        return _compress_memory(data, level)
+        col = _memory_collection()
+        if col is not None:
+            project = str(_validate_project_path(project_path))
+            docs = list(col.find({"project": project}))
+            if not docs:
+                return "no memory saved yet"
+            entries = {d["key"]: d["value"] for d in docs}
+            updated_at = {d["key"]: d.get("updated_at") for d in docs}
+            level = DEFAULT_COMPRESSION  # _compression in project metadata — see #59
+            if query.strip():
+                words = re.findall(r"[a-z0-9]+", query.lower())
+                ranked = _tfidf_rank(entries, words, top_k)
+                if not ranked:
+                    return "no matching memory entries"
+                entries = ranked
+                updated_at = {k: updated_at.get(k) for k in ranked}
+            return _compress_memory(entries, level, updated_at=updated_at)
+        else:
+            data = _read_memory(project_path)
+            if not any(not k.startswith("_") for k in data):
+                return "no memory saved yet"
+            level = max(0, min(2, int(data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION))))
+            if query.strip():
+                words = re.findall(r"[a-z0-9]+", query.lower())
+                system = {k: v for k, v in data.items() if k.startswith("_")}
+                user_entries = {k: v for k, v in data.items() if not k.startswith("_")}
+                ranked = _tfidf_rank(user_entries, words, top_k)
+                if not ranked:
+                    return "no matching memory entries"
+                data = {**system, **ranked}
+            return _compress_memory(data, level)
     except Exception as e:
         return f"error: {e}"
 
@@ -525,12 +581,19 @@ def delete_memory(project_path: str, key: str) -> str:
     if key.startswith("_"):
         return "error: keys starting with '_' are reserved and cannot be deleted"
     try:
-        data = _read_memory(project_path)
-        if key not in data:
-            return f"key '{key}' not found"
-        del data[key]
-        data.pop(f"_updated_{key}", None)
-        _write_memory(project_path, data)
+        col = _memory_collection()
+        if col is not None:
+            project = str(_validate_project_path(project_path))
+            result = col.delete_one({"project": project, "key": key})
+            if result.deleted_count == 0:
+                return f"key '{key}' not found"
+        else:
+            data = _read_memory(project_path)
+            if key not in data:
+                return f"key '{key}' not found"
+            del data[key]
+            data.pop(f"_updated_{key}", None)
+            _write_memory(project_path, data)
         return f"deleted: {key}"
     except Exception as e:
         return f"error: {e}"
@@ -883,9 +946,16 @@ def get_project_summary(project_path: str) -> str:
         p = _validate_project_path(project_path)
         name = p.name
 
-        mem_data = _read_memory(project_path)
-        keys = [k for k in mem_data if not k.startswith("_")]
-        compression = mem_data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
+        col = _memory_collection()
+        if col is not None:
+            project_str = str(p)
+            docs = list(col.find({"project": project_str}, {"key": 1}))
+            keys = [d["key"] for d in docs]
+            compression = DEFAULT_COMPRESSION  # project-level setting handled in #59
+        else:
+            mem_data = _read_memory(project_path)
+            keys = [k for k in mem_data if not k.startswith("_")]
+            compression = mem_data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
 
         last_save = history_store.get_latest_save(project_path)
         recent = history_store.load_index(project_path, last_n=3)
