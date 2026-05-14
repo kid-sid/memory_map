@@ -9,12 +9,16 @@ import math
 import datetime
 import concurrent.futures
 import tempfile
+import logging
+import warnings
 
 import pathspec
 
 import portalocker
 import history_store
 from redact import redact_secrets
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("file-structure")
 
@@ -34,6 +38,9 @@ HISTORY_SUMMARISE_N = int(os.environ.get("MCP_HISTORY_SUMMARISE_N", "10"))
 MEMORY_SIMILARITY_THRESHOLD = 0.7
 GLOBAL_MEMORY_FILE = pathlib.Path.home() / ".mcp_global_memory.json"
 MAX_LOCAL_DEPTH = 10  # hard cap on get_local_structure depth
+_GLOBAL_SENTINEL = "__global__"
+AUTO_MIGRATE = os.environ.get("MEMORY_MAP_AUTO_MIGRATE", "1") != "0"
+_auto_migrated_projects: set = set()
 
 _WORKSPACE_ROOT: pathlib.Path | None = (
     pathlib.Path(os.environ["MCP_WORKSPACE_ROOT"]).resolve()
@@ -57,6 +64,21 @@ def _validate_project_path(path: str) -> pathlib.Path:
             f"allowed workspace root '{_WORKSPACE_ROOT}'"
         )
     return resolved
+
+
+def _normalize_project_path(path: str) -> str:
+    resolved = _validate_project_path(path)
+    if str(resolved) == _GLOBAL_SENTINEL:
+        raise ValueError(f"project path cannot be '{_GLOBAL_SENTINEL}'")
+    return str(resolved)
+
+
+def _check_user_key(key: str) -> "str | None":
+    if key.startswith("_"):
+        return "error: keys starting with '_' are reserved for system use"
+    if not KEY_PATTERN.match(key):
+        return "error: key must be 1-100 chars using only letters, digits, _ or -"
+    return None
 
 ABBREVIATIONS = {
     "python": "py", "javascript": "js", "typescript": "ts",
@@ -337,7 +359,9 @@ def get_git_history(path: str, count: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 # MongoDB memory collection — lazy singleton, shares the same MongoClient as
-# the history collection.  Returns None when MongoDB is unconfigured.
+# history_store._get_collection() so the process holds exactly one connection
+# pool regardless of how many tools are called.  Returns None when MongoDB is
+# unconfigured; all callers fall back to the file-based path in that case.
 _memory_col = None
 _memory_col_init_done = False
 
@@ -373,9 +397,58 @@ def _write_memory(project_path: str, data: dict) -> None:
 
 
 def _read_compression_level(project_path: str) -> int:
+    col = _memory_collection()
+    if col is not None:
+        try:
+            project = _normalize_project_path(project_path)
+            doc = col.find_one({"project": project, "key": COMPRESSION_KEY})
+            if doc is not None:
+                return max(0, min(2, int(doc["value"])))
+        except Exception:
+            pass
+        return DEFAULT_COMPRESSION
     data = _load_json_safe(_memory_path(project_path), {})
     level = data.get(COMPRESSION_KEY, DEFAULT_COMPRESSION)
     return max(0, min(2, int(level)))
+
+
+def _auto_migrate_project(project: str, col, project_path_raw: str) -> None:
+    if not AUTO_MIGRATE or project in _auto_migrated_projects:
+        return
+    try:
+        sentinel = col.find_one({"project": project, "key": "__migrated_from_file__"})
+        if sentinel is not None:
+            _auto_migrated_projects.add(project)
+            return
+        mem_path = pathlib.Path(project_path_raw) / MEMORY_FILE
+        if mem_path.exists():
+            data = _load_json_safe(mem_path, {})
+            user_keys = {k: v for k, v in data.items() if not k.startswith("_")}
+            if user_keys:
+                now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                for k, v in user_keys.items():
+                    ts = data.get(f"_updated_{k}", now_str)
+                    col.update_one(
+                        {"project": project, "key": k},
+                        {"$setOnInsert": {"value": v, "updated_at": ts, "schema_version": 1}},
+                        upsert=True,
+                    )
+                comp = data.get(COMPRESSION_KEY)
+                if comp is not None:
+                    col.update_one(
+                        {"project": project, "key": COMPRESSION_KEY},
+                        {"$setOnInsert": {"value": str(comp), "schema_version": 1}},
+                        upsert=True,
+                    )
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        col.update_one(
+            {"project": project, "key": "__migrated_from_file__"},
+            {"$set": {"value": now_str, "schema_version": 1}},
+            upsert=True,
+        )
+        _auto_migrated_projects.add(project)
+    except Exception as exc:
+        logger.warning("auto-migrate failed for %s: %s", project, exc)
 
 
 def _shorten_key(key: str) -> str:
@@ -493,10 +566,9 @@ def _word_jaccard(a: str, b: str) -> float:
 @mcp.tool()
 def save_memory(project_path: str, key: str, content: str) -> str:
     """Save or update a memory entry for a project. Use short keys (e.g. 'stack', 'architecture')."""
-    if key.startswith("_"):
-        return "error: keys starting with '_' are reserved for system use"
-    if not KEY_PATTERN.match(key):
-        return "error: key must be 1-100 chars using only letters, digits, _ or -"
+    key_err = _check_user_key(key)
+    if key_err:
+        return key_err
     content = redact_secrets(content)
     if len(content.encode("utf-8")) > MAX_ENTRY_KB * 1024:
         return f"error: content exceeds {MAX_ENTRY_KB}KB limit (set MCP_MAX_ENTRY_KB to override)"
@@ -504,14 +576,18 @@ def save_memory(project_path: str, key: str, content: str) -> str:
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         col = _memory_collection()
         if col is not None:
-            project = str(_validate_project_path(project_path))
+            project = _normalize_project_path(project_path)
+            _auto_migrate_project(project, col, project_path)
             col.update_one(
                 {"project": project, "key": key},
                 {"$set": {"value": content, "updated_at": now_str, "schema_version": 1}},
                 upsert=True,
             )
-            other_docs = list(col.find({"project": project, "key": {"$ne": key}}, {"key": 1, "value": 1}))
-            existing = {d["key"]: d["value"] for d in other_docs}
+            other_docs = list(col.find(
+                {"project": project, "key": {"$nin": [key, "__migrated_from_file__"]}},
+                {"key": 1, "value": 1},
+            ))
+            existing = {d["key"]: d["value"] for d in other_docs if not d["key"].startswith("_")}
         else:
             data = _read_memory(project_path)
             data[key] = content
@@ -542,13 +618,24 @@ def load_memory(project_path: str, query: str = "", top_k: int = 10) -> str:
     try:
         col = _memory_collection()
         if col is not None:
-            project = str(_validate_project_path(project_path))
+            project = _normalize_project_path(project_path)
+            _auto_migrate_project(project, col, project_path)
             docs = list(col.find({"project": project}))
-            if not docs:
+            level = DEFAULT_COMPRESSION
+            entries = {}
+            updated_at = {}
+            for d in docs:
+                k = d["key"]
+                if k == COMPRESSION_KEY:
+                    try:
+                        level = max(0, min(2, int(d["value"])))
+                    except (ValueError, TypeError):
+                        pass
+                elif not k.startswith("_"):
+                    entries[k] = d["value"]
+                    updated_at[k] = d.get("updated_at")
+            if not entries:
                 return "no memory saved yet"
-            entries = {d["key"]: d["value"] for d in docs}
-            updated_at = {d["key"]: d.get("updated_at") for d in docs}
-            level = DEFAULT_COMPRESSION  # _compression in project metadata — see #59
             if query.strip():
                 words = re.findall(r"[a-z0-9]+", query.lower())
                 ranked = _tfidf_rank(entries, words, top_k)
@@ -578,12 +665,16 @@ def load_memory(project_path: str, query: str = "", top_k: int = 10) -> str:
 @mcp.tool()
 def delete_memory(project_path: str, key: str) -> str:
     """Delete a specific memory entry for a project."""
+    # Only the leading-underscore check is enforced here; KEY_PATTERN is not required
+    # so callers can delete keys that were saved before the pattern was tightened.
     if key.startswith("_"):
         return "error: keys starting with '_' are reserved and cannot be deleted"
+    if not KEY_PATTERN.match(key):
+        return f"key '{key}' not found"
     try:
         col = _memory_collection()
         if col is not None:
-            project = str(_validate_project_path(project_path))
+            project = _normalize_project_path(project_path)
             result = col.delete_one({"project": project, "key": key})
             if result.deleted_count == 0:
                 return f"key '{key}' not found"
@@ -605,9 +696,18 @@ def set_compression(project_path: str, level: int) -> str:
     if level not in (0, 1, 2):
         return "error: level must be 0, 1, or 2"
     try:
-        data = _read_memory(project_path)
-        data[COMPRESSION_KEY] = level
-        _write_memory(project_path, data)
+        col = _memory_collection()
+        if col is not None:
+            project = _normalize_project_path(project_path)
+            col.update_one(
+                {"project": project, "key": COMPRESSION_KEY},
+                {"$set": {"value": str(level), "schema_version": 1}},
+                upsert=True,
+            )
+        else:
+            data = _read_memory(project_path)
+            data[COMPRESSION_KEY] = level
+            _write_memory(project_path, data)
         return f"compression set to {level}"
     except Exception as e:
         return f"error: {e}"
@@ -906,6 +1006,15 @@ def _iter_project_dirs(root: pathlib.Path, max_depth: int, _current: int = 1):
         pass
 
 
+def _within_depth(project: str, base_str: str, max_depth: int) -> bool:
+    """Return True if the project path is within max_depth levels of base_str."""
+    try:
+        rel = pathlib.Path(project).relative_to(base_str)
+        return len(rel.parts) <= max_depth
+    except ValueError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Tools: Multi-project integration
 # ---------------------------------------------------------------------------
@@ -924,6 +1033,35 @@ def list_projects(base_path: str, max_depth: int = 1) -> str:
         return json.dumps({"error": f"'{base_path}' is not a valid directory"})
 
     max_depth = max(1, min(max_depth, MAX_PROJECT_SCAN_DEPTH))
+    col = _memory_collection()
+    if col is not None:
+        base_str = str(root)
+        prefix = re.escape(base_str)
+        docs = list(col.find(
+            {"project": {"$regex": f"^{prefix}", "$ne": _GLOBAL_SENTINEL}},
+            {"project": 1, "key": 1},
+        ))
+        by_project: dict = {}
+        for d in docs:
+            proj = d["project"]
+            if not _within_depth(proj, base_str, max_depth):
+                continue
+            k = d["key"]
+            if proj not in by_project:
+                by_project[proj] = 0
+            if not k.startswith("_"):
+                by_project[proj] += 1
+        projects = []
+        for proj, key_count in sorted(by_project.items()):
+            last_save = history_store.get_latest_save(proj)
+            projects.append({
+                "path": proj,
+                "name": pathlib.Path(proj).name,
+                "key_count": key_count,
+                "last_save": last_save,
+            })
+        return json.dumps(projects)
+
     projects = []
     for entry in _iter_project_dirs(root, max_depth):
         data = _load_json_safe(entry / MEMORY_FILE, {})
@@ -948,10 +1086,16 @@ def get_project_summary(project_path: str) -> str:
 
         col = _memory_collection()
         if col is not None:
-            project_str = str(p)
-            docs = list(col.find({"project": project_str}, {"key": 1}))
-            keys = [d["key"] for d in docs]
-            compression = DEFAULT_COMPRESSION  # project-level setting handled in #59
+            project_str = _normalize_project_path(project_path)
+            docs = list(col.find({"project": project_str}, {"key": 1, "value": 1}))
+            keys = [d["key"] for d in docs if not d["key"].startswith("_")]
+            compression = DEFAULT_COMPRESSION
+            for d in docs:
+                if d["key"] == COMPRESSION_KEY:
+                    try:
+                        compression = max(0, min(2, int(d["value"])))
+                    except (ValueError, TypeError):
+                        pass
         else:
             mem_data = _read_memory(project_path)
             keys = [k for k in mem_data if not k.startswith("_")]
@@ -993,6 +1137,41 @@ def load_cross_project_memory(base_path: str, query_keys: str = "", max_depth: i
     max_depth = max(1, min(max_depth, MAX_PROJECT_SCAN_DEPTH))
     filter_keys = {k.strip() for k in query_keys.split(",") if k.strip()} if query_keys else set()
 
+    col = _memory_collection()
+    if col is not None:
+        base_str = str(root)
+        prefix = re.escape(base_str)
+        docs = list(col.find(
+            {"project": {"$regex": f"^{prefix}", "$ne": _GLOBAL_SENTINEL}},
+        ))
+        by_project: dict = {}
+        for d in docs:
+            proj = d["project"]
+            if not _within_depth(proj, base_str, max_depth):
+                continue
+            if proj not in by_project:
+                by_project[proj] = {"entries": {}, "updated_at": {}, "level": DEFAULT_COMPRESSION}
+            k = d["key"]
+            if k == COMPRESSION_KEY:
+                try:
+                    by_project[proj]["level"] = max(0, min(2, int(d["value"])))
+                except (ValueError, TypeError):
+                    pass
+            elif not k.startswith("_"):
+                by_project[proj]["entries"][k] = d["value"]
+                by_project[proj]["updated_at"][k] = d.get("updated_at")
+        sections = []
+        for proj in sorted(by_project):
+            info = by_project[proj]
+            entries = info["entries"]
+            if filter_keys:
+                entries = {k: v for k, v in entries.items() if k in filter_keys}
+            if not entries:
+                continue
+            compressed = _compress_memory(entries, info["level"], updated_at=info["updated_at"])
+            sections.append(f"=== {pathlib.Path(proj).name} ===\n{compressed}")
+        return "\n\n".join(sections) if sections else "no projects with memory found"
+
     sections = []
     for entry in _iter_project_dirs(root, max_depth):
         data = _load_json_safe(entry / MEMORY_FILE, {})
@@ -1027,6 +1206,33 @@ def search_across_projects(base_path: str, keyword: str, max_depth: int = 1) -> 
     kw = keyword.lower()
     matches = []
 
+    col = _memory_collection()
+    if col is not None:
+        base_str = str(root)
+        prefix_pat = re.escape(base_str)
+        docs = list(col.find(
+            {"project": {"$regex": f"^{prefix_pat}", "$ne": _GLOBAL_SENTINEL}},
+            {"project": 1, "key": 1, "value": 1},
+        ))
+        for d in docs:
+            proj = d["project"]
+            if not _within_depth(proj, base_str, max_depth):
+                continue
+            k = d["key"]
+            if k.startswith("_"):
+                continue
+            text = str(d["value"])
+            if kw in text.lower():
+                pos = text.lower().find(kw)
+                start = max(0, pos - 30)
+                end = min(len(text), pos + 70)
+                pfx = "..." if start > 0 else ""
+                sfx = "..." if end < len(text) else ""
+                window = pfx + text[start:end] + sfx
+                proj_name = pathlib.Path(d["project"]).name
+                matches.append(f"{proj_name} / {k}: \"{window}\"")
+        return "\n".join(matches) if matches else f"no matches for '{keyword}'"
+
     for entry in _iter_project_dirs(root, max_depth):
         data = _load_json_safe(entry / MEMORY_FILE, {})
         for k, v in data.items():
@@ -1037,9 +1243,9 @@ def search_across_projects(base_path: str, keyword: str, max_depth: int = 1) -> 
                 pos = text.lower().find(kw)
                 start = max(0, pos - 30)
                 end = min(len(text), pos + 70)
-                prefix = "..." if start > 0 else ""
-                suffix = "..." if end < len(text) else ""
-                window = prefix + text[start:end] + suffix
+                pfx = "..." if start > 0 else ""
+                sfx = "..." if end < len(text) else ""
+                window = pfx + text[start:end] + sfx
                 matches.append(f"{entry.name} / {k}: \"{window}\"")
 
     return "\n".join(matches) if matches else f"no matches for '{keyword}'"
@@ -1056,16 +1262,24 @@ def _write_global_memory(data: dict) -> None:
 @mcp.tool()
 def save_global_memory(key: str, content: str) -> str:
     """Save a user-level memory entry available across all projects (e.g. name, preferred stack)."""
-    if key.startswith("_"):
-        return "error: keys starting with '_' are reserved for system use"
-    if not KEY_PATTERN.match(key):
-        return "error: key must be 1-100 chars using only letters, digits, _ or -"
+    key_err = _check_user_key(key)
+    if key_err:
+        return key_err
     if len(content.encode("utf-8")) > MAX_ENTRY_KB * 1024:
         return f"error: content exceeds {MAX_ENTRY_KB}KB limit"
     try:
-        data = _read_global_memory()
-        data[key] = content
-        _write_global_memory(data)
+        col = _memory_collection()
+        if col is not None:
+            now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            col.update_one(
+                {"project": _GLOBAL_SENTINEL, "key": key},
+                {"$set": {"value": content, "updated_at": now_str, "schema_version": 1}},
+                upsert=True,
+            )
+        else:
+            data = _read_global_memory()
+            data[key] = content
+            _write_global_memory(data)
         return f"global saved: {key}"
     except Exception as e:
         return f"error: {e}"
@@ -1075,14 +1289,116 @@ def save_global_memory(key: str, content: str) -> str:
 def load_global_memory() -> str:
     """Load user-level memory available across all projects."""
     try:
-        data = _read_global_memory()
-        entries = {k: v for k, v in data.items() if not k.startswith("_")}
-        if not entries:
-            return "=== GLOBAL ===\nno global memory saved yet"
-        compressed = _compress_memory(data, DEFAULT_COMPRESSION)
-        return f"=== GLOBAL ===\n{compressed}"
+        col = _memory_collection()
+        if col is not None:
+            docs = list(col.find({"project": _GLOBAL_SENTINEL}))
+            entries = {d["key"]: d["value"] for d in docs if not d["key"].startswith("_")}
+            updated_at = {d["key"]: d.get("updated_at") for d in docs if not d["key"].startswith("_")}
+            if not entries:
+                return "=== GLOBAL ===\nno global memory saved yet"
+            compressed = _compress_memory(entries, DEFAULT_COMPRESSION, updated_at=updated_at)
+            return f"=== GLOBAL ===\n{compressed}"
+        else:
+            data = _read_global_memory()
+            entries = {k: v for k, v in data.items() if not k.startswith("_")}
+            if not entries:
+                return "=== GLOBAL ===\nno global memory saved yet"
+            compressed = _compress_memory(data, DEFAULT_COMPRESSION)
+            return f"=== GLOBAL ===\n{compressed}"
     except Exception as e:
         return f"error: {e}"
+
+
+@mcp.tool()
+def migrate_memory_to_mongo(project_path: str, dry_run: bool = False, force: bool = False) -> str:
+    """Migrate .mcp_memory.json (or ~/.mcp_global_memory.json) into MongoDB.
+
+    project_path: filesystem path of the project, or "__global__" to migrate
+                  the global memory file (~/.mcp_global_memory.json).
+    dry_run: if True, report what would be migrated without writing anything.
+    force: if True, overwrite existing MongoDB entries with file values.
+    """
+    col = _memory_collection()
+    if col is None:
+        return "error: MongoDB is not configured — set MEMORY_MAP_MONGO_URI"
+
+    is_global = project_path == _GLOBAL_SENTINEL
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if is_global:
+        source_path = GLOBAL_MEMORY_FILE
+        project = _GLOBAL_SENTINEL
+    else:
+        try:
+            project = _normalize_project_path(project_path)
+        except ValueError as e:
+            return f"error: {e}"
+        source_path = pathlib.Path(project) / MEMORY_FILE
+
+    if not source_path.exists():
+        return f"error: file not found: {source_path}"
+
+    data = _load_json_safe(source_path, {})
+    user_keys = {k: v for k, v in data.items() if not k.startswith("_")}
+    if not user_keys and not is_global:
+        return "no user keys to migrate"
+
+    if not dry_run and not is_global:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = source_path.parent / f"{source_path.name}.bak.{ts}"
+        try:
+            import shutil
+            shutil.copy2(str(source_path), str(backup))
+        except Exception as e:
+            return f"error: could not create backup: {e}"
+
+    migrated = 0
+    skipped = 0
+    for k, v in user_keys.items():
+        ts = data.get(f"_updated_{k}", now_str)
+        if not force:
+            existing = col.find_one({"project": project, "key": k})
+            if existing:
+                skipped += 1
+                continue
+        if not dry_run:
+            col.update_one(
+                {"project": project, "key": k},
+                {"$set": {"value": v, "updated_at": ts, "schema_version": 1}},
+                upsert=True,
+            )
+        migrated += 1
+
+    comp = data.get(COMPRESSION_KEY)
+    comp_migrated = False
+    if comp is not None and not is_global:
+        existing_comp = col.find_one({"project": project, "key": COMPRESSION_KEY})
+        if force or not existing_comp:
+            if not dry_run:
+                col.update_one(
+                    {"project": project, "key": COMPRESSION_KEY},
+                    {"$set": {"value": str(comp), "schema_version": 1}},
+                    upsert=True,
+                )
+            comp_migrated = True
+
+    if not dry_run:
+        col.update_one(
+            {"project": project, "key": "__migrated_from_file__"},
+            {"$set": {"value": now_str, "schema_version": 1}},
+            upsert=True,
+        )
+        _auto_migrated_projects.add(project)
+
+    summary = (
+        f"{'[dry-run] ' if dry_run else ''}"
+        f"migrated: {migrated}, skipped (already exists): {skipped}"
+    )
+    if comp_migrated:
+        summary += f", compression={comp} migrated"
+    if not dry_run and not is_global:
+        summary += f", backup: {backup.name}"
+    return summary
 
 
 if __name__ == "__main__":

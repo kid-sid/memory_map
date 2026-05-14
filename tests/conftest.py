@@ -31,6 +31,8 @@ def mongo_cleanup(tmp_path):
 
     Cleans both the history and memory collections, keyed by tmp_path prefix,
     so only test-generated documents are removed — real project data is untouched.
+    Also cleans __global__ memory docs and __migrated_from_file__ sentinels added
+    during the test run.
     """
     yield
     col = history_store._get_collection()
@@ -38,6 +40,17 @@ def mongo_cleanup(tmp_path):
         prefix = _re_escape(str(tmp_path))
         col.delete_many({"project": {"$regex": f"^{prefix}"}})
         try:
-            col.database["memory"].delete_many({"project": {"$regex": f"^{prefix}"}})
+            mem_col = col.database["memory"]
+            mem_col.delete_many({"project": {"$regex": f"^{prefix}"}})
+            mem_col.delete_many({"project": "__global__"})
         except Exception:
             pass
+
+
+@pytest.fixture(autouse=True)
+def clear_auto_migrate_cache():
+    """Clear the per-process auto-migrate cache between tests."""
+    import server
+    server._auto_migrated_projects.clear()
+    yield
+    server._auto_migrated_projects.clear()

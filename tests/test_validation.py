@@ -184,3 +184,12 @@ def test_save_memory_no_self_warning_on_update(tmp_path):
     save_memory(str(tmp_path), "stack", "FastAPI with MongoDB")
     result = save_memory(str(tmp_path), "stack", "FastAPI with MongoDB and Redis")
     assert "warning" not in result
+
+
+def test_delete_wildcard_key_does_not_bulk_delete(tmp_path):
+    save_memory(str(tmp_path), "stack", "FastAPI")
+    save_memory(str(tmp_path), "gotchas", "portalocker required")
+    result = delete_memory(str(tmp_path), "*")
+    assert result.startswith("error") or "not found" in result
+    loaded = load_memory(str(tmp_path))
+    assert "FastAPI" in loaded

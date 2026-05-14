@@ -18,7 +18,7 @@ def setup_project(base: pathlib.Path, name: str, memories: dict) -> pathlib.Path
 
 # --- list_projects ---
 
-def test_list_projects_finds_memory_projects(tmp_path, requires_file_mode):
+def test_list_projects_finds_memory_projects(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python"})
     setup_project(tmp_path, "proj-b", {"stack": "Go"})
     result = json.loads(list_projects(str(tmp_path)))
@@ -27,7 +27,7 @@ def test_list_projects_finds_memory_projects(tmp_path, requires_file_mode):
     assert "proj-b" in names
 
 
-def test_list_projects_excludes_dirs_without_memory(tmp_path, requires_file_mode):
+def test_list_projects_excludes_dirs_without_memory(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python"})
     (tmp_path / "not-a-project").mkdir()
     result = json.loads(list_projects(str(tmp_path)))
@@ -35,7 +35,7 @@ def test_list_projects_excludes_dirs_without_memory(tmp_path, requires_file_mode
     assert "not-a-project" not in names
 
 
-def test_list_projects_key_count(tmp_path, requires_file_mode):
+def test_list_projects_key_count(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python", "entry": "main.py"})
     result = json.loads(list_projects(str(tmp_path)))
     proj_a = next(p for p in result if p["name"] == "proj-a")
@@ -49,7 +49,7 @@ def test_list_projects_invalid_path():
 
 # --- load_cross_project_memory ---
 
-def test_load_cross_project_all_keys(tmp_path, requires_file_mode):
+def test_load_cross_project_all_keys(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python FastAPI"})
     setup_project(tmp_path, "proj-b", {"stack": "Go + Gin"})
     result = load_cross_project_memory(str(tmp_path))
@@ -59,14 +59,14 @@ def test_load_cross_project_all_keys(tmp_path, requires_file_mode):
     assert "Go + Gin" in result
 
 
-def test_load_cross_project_filtered_keys(tmp_path, requires_file_mode):
+def test_load_cross_project_filtered_keys(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python", "notes": "secret notes"})
     result = load_cross_project_memory(str(tmp_path), query_keys="stack")
     assert "Python" in result
     assert "secret notes" not in result
 
 
-def test_load_cross_project_no_match_for_filter(tmp_path, requires_file_mode):
+def test_load_cross_project_no_match_for_filter(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python"})
     result = load_cross_project_memory(str(tmp_path), query_keys="nonexistent_key")
     assert "no projects with memory found" in result
@@ -79,7 +79,7 @@ def test_load_cross_project_empty_base(tmp_path):
 
 # --- search_across_projects ---
 
-def test_search_finds_match(tmp_path, requires_file_mode):
+def test_search_finds_match(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python FastAPI + PostgreSQL"})
     setup_project(tmp_path, "proj-b", {"stack": "Go + MySQL"})
     result = search_across_projects(str(tmp_path), "PostgreSQL")
@@ -87,13 +87,13 @@ def test_search_finds_match(tmp_path, requires_file_mode):
     assert "proj-b" not in result
 
 
-def test_search_case_insensitive(tmp_path, requires_file_mode):
+def test_search_case_insensitive(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "python fastapi"})
     result = search_across_projects(str(tmp_path), "PYTHON")
     assert "proj-a" in result
 
 
-def test_search_no_matches(tmp_path, requires_file_mode):
+def test_search_no_matches(tmp_path):
     setup_project(tmp_path, "proj-a", {"stack": "Python"})
     result = search_across_projects(str(tmp_path), "Rust")
     assert "no matches" in result
@@ -104,14 +104,29 @@ def test_search_empty_keyword(tmp_path):
     assert result.startswith("error")
 
 
-def test_search_skips_system_keys(tmp_path, requires_file_mode):
-    proj = tmp_path / "proj-a"
-    proj.mkdir()
-    mem_file = proj / ".mcp_memory.json"
-    import json as _json
-    mem_file.write_text(_json.dumps({"_compression": 1, "stack": "Python"}), encoding="utf-8")
-    result = search_across_projects(str(tmp_path), "_compression")
-    assert "no matches" in result
+def test_search_skips_system_keys(tmp_path):
+    from server import _memory_collection
+    col = _memory_collection()
+    if col is not None:
+        # In MongoDB mode, write a doc with a system key directly and verify it's excluded
+        import pathlib as _pathlib
+        proj = tmp_path / "proj-a"
+        proj.mkdir()
+        project_str = str(_pathlib.Path(str(proj)).resolve())
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        col.insert_one({"project": project_str, "key": "_compression", "value": "1", "schema_version": 1})
+        col.insert_one({"project": project_str, "key": "stack", "value": "Python", "updated_at": now, "schema_version": 1})
+        result = search_across_projects(str(tmp_path), "_compression")
+        assert "no matches" in result
+    else:
+        proj = tmp_path / "proj-a"
+        proj.mkdir()
+        mem_file = proj / ".mcp_memory.json"
+        import json as _json
+        mem_file.write_text(_json.dumps({"_compression": 1, "stack": "Python"}), encoding="utf-8")
+        result = search_across_projects(str(tmp_path), "_compression")
+        assert "no matches" in result
 
 
 # --- get_project_summary ---
