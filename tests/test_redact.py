@@ -26,6 +26,20 @@ def test_anthropic_key():
     assert "AbCdEfGhIjKlMnOpQrStUvWxYz1234" not in result
 
 
+def test_github_classic_pat():
+    text = "token: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890"
+    result = redact_secrets(text)
+    assert "[REDACTED]" in result
+    assert "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890" not in result
+
+
+def test_github_fine_grained_pat():
+    pat = "github_pat_" + "A" * 82
+    result = redact_secrets(f"GITHUB_TOKEN={pat}")
+    assert "[REDACTED]" in result
+    assert "A" * 82 not in result
+
+
 def test_aws_access_key():
     text = "aws key: AKIAIOSFODNN7EXAMPLE"
     result = redact_secrets(text)

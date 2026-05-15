@@ -18,6 +18,10 @@ _PATTERNS = [
     re.compile(r'sk-[A-Za-z0-9]{20,}'),
     # AWS access keys
     re.compile(r'AKIA[A-Z0-9]{16}'),
+    # GitHub classic PAT
+    re.compile(r'ghp_[A-Za-z0-9]{36}'),
+    # GitHub fine-grained PAT
+    re.compile(r'github_pat_[A-Za-z0-9_]{82}'),
 ]
 
 # Generic inline assignments: password=..., api_key=..., etc.

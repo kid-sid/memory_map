@@ -1,7 +1,8 @@
 # Memory Map — MCP Server for Claude Code
 
 [![CI](https://github.com/kid-sid/memory_map/actions/workflows/ci.yml/badge.svg)](https://github.com/kid-sid/memory_map/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/memory-map-mcp)](https://pypi.org/project/memory-map-mcp/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 An MCP server that gives Claude persistent memory and conversation history — so it understands your project from the very first message of every session, without you re-explaining anything.
@@ -18,9 +19,31 @@ An MCP server that gives Claude persistent memory and conversation history — s
 
 ---
 
+## Quick Install
+
+```bash
+pip install memory-map-mcp
+```
+
+With OpenAI vector search:
+```bash
+pip install "memory-map-mcp[embed-openai]"
+```
+
+With local CPU vector search (no API key):
+```bash
+pip install "memory-map-mcp[embed-local]"
+```
+
+Then jump to [Step 2 — Configure environment variables](#step-2--configure-environment-variables) and [Step 3 — Register the MCP server](#step-3--register-the-mcp-server-with-claude-code).
+
+> **Developing or contributing?** See the [Development Setup](#development-setup) section below for the git-clone path.
+
+---
+
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - Git installed and on your PATH
 - [Claude Code](https://claude.ai/code) CLI installed
 - MongoDB — local or Atlas — for persistent conversation history storage
@@ -29,25 +52,35 @@ An MCP server that gives Claude persistent memory and conversation history — s
 
 ## Setup
 
-### Step 1 — Clone and install
+### Step 1 — Install
+
+**From PyPI (recommended):**
+```bash
+pip install memory-map-mcp
+```
+
+**From source (for development):**
+```bash
+git clone https://github.com/kid-sid/memory_map.git
+cd memory_map
+pip install -e ".[dev]"
+```
+
+---
+
+## Development Setup
 
 ```bash
 git clone https://github.com/kid-sid/memory_map.git
 cd memory_map
-```
-
-**Windows:**
-```bash
 python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-```
 
-**Mac/Linux:**
-```bash
-python3 -m venv venv
+# Windows:
+venv\Scripts\activate
+# Mac/Linux:
 source venv/bin/activate
-pip install -r requirements.txt
+
+pip install -e ".[dev]"
 ```
 
 ---
@@ -106,16 +139,10 @@ That's all. The server creates the database and collection automatically on firs
 
 ### Step 3 — Register the MCP server with Claude Code
 
-Run this once (replace the path with your actual path). The `-s user` flag makes it available in **all projects**.
+Run this once. The `-s user` flag makes it available in **all projects**.
 
-**Windows with venv:**
 ```bash
-claude mcp add -s user memory_map C:/Users/yourname/memory_map/venv/Scripts/python.exe C:/Users/yourname/memory_map/server.py
-```
-
-**Mac/Linux:**
-```bash
-claude mcp add -s user memory_map python3 /home/yourname/memory_map/server.py
+claude mcp add -s user memory_map -- memory-map-mcp
 ```
 
 Restart Claude Code after running this.
@@ -261,9 +288,9 @@ This auto-saves each Q&A pair as it happens — no API key required.
 
 **Configure the hooks globally in `~/.claude/settings.json`:**
 
-Replace the path to match where you cloned this repo.
+The `memory-map-hook` command is available after `pip install memory-map-mcp`. No path substitution needed.
 
-**Windows (`C:\Users\yourname\.claude\settings.json`):**
+**`~/.claude/settings.json` (all platforms):**
 ```json
 {
   "hooks": {
@@ -273,7 +300,7 @@ Replace the path to match where you cloned this repo.
         "hooks": [
           {
             "type": "command",
-            "command": "python C:/Users/yourname/memory_map/history_hook.py",
+            "command": "memory-map-hook",
             "timeout": 10
           }
         ]
@@ -285,7 +312,7 @@ Replace the path to match where you cloned this repo.
         "hooks": [
           {
             "type": "command",
-            "command": "python C:/Users/yourname/memory_map/history_hook.py --force",
+            "command": "memory-map-hook --force",
             "timeout": 15
           }
         ]
@@ -297,52 +324,7 @@ Replace the path to match where you cloned this repo.
         "hooks": [
           {
             "type": "command",
-            "command": "python C:/Users/yourname/memory_map/history_hook.py --force",
-            "timeout": 15,
-            "async": true
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-**Mac/Linux (`~/.claude/settings.json`):**
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /home/yourname/memory_map/history_hook.py",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /home/yourname/memory_map/history_hook.py --force",
-            "timeout": 15
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /home/yourname/memory_map/history_hook.py --force",
+            "command": "memory-map-hook --force",
             "timeout": 15,
             "async": true
           }

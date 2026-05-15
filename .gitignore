@@ -4,6 +4,11 @@ __pycache__/
 .pytest_cache/
 *.pyc
 
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
 .mcp_memory.json
 .mcp_memory.json.lock
 *.bak.*
@@ -20,3 +25,5 @@ benchmarks/results/*.json
 tests/test_client.py
 tests/quick_git_test.py
 tests/test_setup.py
+test_question.py
+test_setup.py
