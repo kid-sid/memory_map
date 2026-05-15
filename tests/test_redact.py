@@ -1,6 +1,6 @@
 import os
 import pytest
-from redact import redact_secrets, _load_user_patterns
+from memory_map_mcp.redact import redact_secrets, _load_user_patterns
 
 
 # --- Pattern coverage ---

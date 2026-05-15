@@ -2,8 +2,8 @@
 
 import datetime
 import pytest
-import history_store
-from server import save_history, load_history, get_history_chunks
+from memory_map_mcp import history_store
+from memory_map_mcp.server import save_history, load_history, get_history_chunks
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +424,7 @@ def test_summarise_oldest_chunks_too_few(tmp_path, requires_mongodb):
 
 
 def test_summarise_history_mcp_tool(tmp_path, requires_mongodb):
-    from server import summarise_history
+    from memory_map_mcp.server import summarise_history
     project = str(tmp_path)
     for i in range(4):
         history_store.save_chunk(project, "s", f"user: task {i}\nassistant: done {i}", [])

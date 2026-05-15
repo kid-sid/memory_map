@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
-load_dotenv(pathlib.Path(__file__).parent / ".env")
+load_dotenv()
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIMS = 1536

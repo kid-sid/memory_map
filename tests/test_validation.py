@@ -1,7 +1,7 @@
 import pytest
 import json
 import datetime
-from server import save_memory, load_memory, delete_memory, _load_json_safe, _read_memory, _write_memory
+from memory_map_mcp.server import save_memory, load_memory, delete_memory, _load_json_safe, _read_memory, _write_memory
 import pathlib
 
 

@@ -21,8 +21,8 @@ import uuid
 
 import pytest
 
-import history_store
-from server import (
+from memory_map_mcp import history_store
+from memory_map_mcp.server import (
     get_history_chunks,
     get_project_summary,
     load_history,
@@ -33,7 +33,7 @@ from server import (
 )
 
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
-HOOK_SCRIPT = str(PROJECT_ROOT / "history_hook.py")
+HOOK_SCRIPT = str(PROJECT_ROOT / "memory_map_mcp" / "history_hook.py")
 
 # ---------------------------------------------------------------------------
 # Realistic dialogue samples — sized to hit specific token ranges so tests

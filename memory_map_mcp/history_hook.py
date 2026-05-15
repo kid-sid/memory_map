@@ -23,8 +23,8 @@ import textwrap
 import uuid
 from datetime import datetime
 
-import history_store
-from redact import redact_secrets
+from memory_map_mcp import history_store
+from memory_map_mcp.redact import redact_secrets
 
 MAX_TURN_CHARS   = int(os.environ.get("MCP_MAX_TURN_CHARS",  "3000"))
 MAX_CHUNK_CHARS  = int(os.environ.get("MCP_MAX_CHUNK_CHARS", "4000"))

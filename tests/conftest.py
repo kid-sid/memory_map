@@ -2,7 +2,7 @@
 
 import re
 import pytest
-import history_store
+from memory_map_mcp import history_store
 
 
 def _re_escape(path: str) -> str:
@@ -20,7 +20,7 @@ def requires_mongodb():
 @pytest.fixture
 def requires_file_mode():
     """Skip if MongoDB is configured — test exercises the file-based memory path only."""
-    from server import _memory_collection
+    from memory_map_mcp.server import _memory_collection
     if _memory_collection() is not None:
         pytest.skip("Test exercises file-based memory path, skipped when MongoDB is configured")
 
@@ -50,7 +50,7 @@ def mongo_cleanup(tmp_path):
 @pytest.fixture(autouse=True)
 def clear_auto_migrate_cache():
     """Clear the per-process auto-migrate cache between tests."""
-    import server
+    import memory_map_mcp.server as server
     server._auto_migrated_projects.clear()
     yield
     server._auto_migrated_projects.clear()

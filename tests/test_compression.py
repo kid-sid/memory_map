@@ -1,5 +1,5 @@
 import pytest
-from server import _compress_memory, _abbreviate, _shorten_key
+from memory_map_mcp.server import _compress_memory, _abbreviate, _shorten_key
 
 
 def test_level_0_raw():

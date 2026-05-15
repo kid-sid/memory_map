@@ -5,7 +5,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fastmcp import Client
-from server import mcp
+from memory_map_mcp.server import mcp
 
 async def main():
     async with Client(mcp) as client:

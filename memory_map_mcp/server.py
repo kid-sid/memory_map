@@ -15,8 +15,8 @@ import warnings
 import pathspec
 
 import portalocker
-import history_store
-from redact import redact_secrets
+from memory_map_mcp import history_store
+from memory_map_mcp.redact import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -1401,5 +1401,9 @@ def migrate_memory_to_mongo(project_path: str, dry_run: bool = False, force: boo
     return summary
 
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

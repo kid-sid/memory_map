@@ -2,7 +2,7 @@
 
 import datetime
 import pytest
-from server import save_memory, load_memory, delete_memory
+from memory_map_mcp.server import save_memory, load_memory, delete_memory
 
 
 def test_save_and_load_memory_mongo(tmp_path, requires_mongodb):
@@ -59,7 +59,7 @@ def test_save_memory_overwrites_existing_mongo(tmp_path, requires_mongodb):
 
 
 def test_stale_warning_mongo(tmp_path, requires_mongodb):
-    from server import _memory_collection
+    from memory_map_mcp.server import _memory_collection
     import pathlib
     col = _memory_collection()
     project = str(pathlib.Path(str(tmp_path)).resolve())

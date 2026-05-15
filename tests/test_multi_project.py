@@ -1,7 +1,7 @@
 import pytest
 import json
 import pathlib
-from server import (
+from memory_map_mcp.server import (
     save_memory, list_projects, load_cross_project_memory,
     search_across_projects, save_global_memory, load_global_memory,
     get_project_summary, save_history,
@@ -105,7 +105,7 @@ def test_search_empty_keyword(tmp_path):
 
 
 def test_search_skips_system_keys(tmp_path):
-    from server import _memory_collection
+    from memory_map_mcp.server import _memory_collection
     col = _memory_collection()
     if col is not None:
         # In MongoDB mode, write a doc with a system key directly and verify it's excluded
@@ -150,7 +150,7 @@ def test_get_project_summary_no_history(tmp_path):
 
 def test_save_and_load_global_memory(tmp_path, monkeypatch):
     global_file = tmp_path / ".mcp_global_memory.json"
-    monkeypatch.setattr("server.GLOBAL_MEMORY_FILE", global_file)
+    monkeypatch.setattr("memory_map_mcp.server.GLOBAL_MEMORY_FILE", global_file)
     save_global_memory("name", "Sidhartha")
     result = load_global_memory()
     assert "GLOBAL" in result
@@ -159,21 +159,21 @@ def test_save_and_load_global_memory(tmp_path, monkeypatch):
 
 def test_global_memory_empty(tmp_path, monkeypatch):
     global_file = tmp_path / ".mcp_global_memory.json"
-    monkeypatch.setattr("server.GLOBAL_MEMORY_FILE", global_file)
+    monkeypatch.setattr("memory_map_mcp.server.GLOBAL_MEMORY_FILE", global_file)
     result = load_global_memory()
     assert "no global memory saved yet" in result
 
 
 def test_global_memory_key_validation(tmp_path, monkeypatch):
     global_file = tmp_path / ".mcp_global_memory.json"
-    monkeypatch.setattr("server.GLOBAL_MEMORY_FILE", global_file)
+    monkeypatch.setattr("memory_map_mcp.server.GLOBAL_MEMORY_FILE", global_file)
     result = save_global_memory("_reserved", "value")
     assert result.startswith("error")
 
 
 def test_global_memory_persists_across_calls(tmp_path, monkeypatch):
     global_file = tmp_path / ".mcp_global_memory.json"
-    monkeypatch.setattr("server.GLOBAL_MEMORY_FILE", global_file)
+    monkeypatch.setattr("memory_map_mcp.server.GLOBAL_MEMORY_FILE", global_file)
     save_global_memory("lang", "Python")
     save_global_memory("editor", "neovim")
     result = load_global_memory()

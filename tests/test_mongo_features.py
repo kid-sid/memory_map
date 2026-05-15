@@ -5,7 +5,7 @@ import pathlib
 import json
 import pytest
 
-from server import (
+from memory_map_mcp.server import (
     save_memory,
     load_memory,
     delete_memory,
@@ -28,7 +28,7 @@ from server import (
 def test_set_compression_mongo(tmp_path, requires_mongodb):
     result = set_compression(str(tmp_path), 2)
     assert result == "compression set to 2"
-    from server import _read_compression_level
+    from memory_map_mcp.server import _read_compression_level
     assert _read_compression_level(str(tmp_path)) == 2
 
 
@@ -40,7 +40,7 @@ def test_compression_persists_in_load_memory(tmp_path, requires_mongodb):
 
 
 def test_compression_default_when_not_set(tmp_path, requires_mongodb):
-    from server import _read_compression_level
+    from memory_map_mcp.server import _read_compression_level
     assert _read_compression_level(str(tmp_path)) == 1
 
 
@@ -85,12 +85,12 @@ def test_global_memory_excluded_from_list_projects(tmp_path, requires_mongodb):
 
 
 def load_cross_project_memory_helper(tmp_path):
-    from server import load_cross_project_memory
+    from memory_map_mcp.server import load_cross_project_memory
     return load_cross_project_memory(str(tmp_path))
 
 
 def list_projects_helper(tmp_path):
-    from server import list_projects
+    from memory_map_mcp.server import list_projects
     return list_projects(str(tmp_path))
 
 
@@ -99,8 +99,8 @@ def list_projects_helper(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_migrate_memory_no_mongo_configured(tmp_path, monkeypatch):
-    monkeypatch.setattr("server._memory_col", None)
-    monkeypatch.setattr("server._memory_col_init_done", True)
+    monkeypatch.setattr("memory_map_mcp.server._memory_col", None)
+    monkeypatch.setattr("memory_map_mcp.server._memory_col_init_done", True)
     result = migrate_memory_to_mongo(str(tmp_path))
     assert "error" in result
     assert "MongoDB" in result
@@ -173,7 +173,7 @@ def test_migrate_memory_creates_backup(tmp_path, requires_mongodb):
 def test_migrate_global_memory(requires_mongodb, tmp_path, monkeypatch):
     global_file = tmp_path / ".mcp_global_memory.json"
     global_file.write_text(json.dumps({"name": "Sidhartha"}), encoding="utf-8")
-    monkeypatch.setattr("server.GLOBAL_MEMORY_FILE", global_file)
+    monkeypatch.setattr("memory_map_mcp.server.GLOBAL_MEMORY_FILE", global_file)
     result = migrate_memory_to_mongo("__global__")
     assert "migrated: 1" in result
     col = _memory_collection()
@@ -187,7 +187,7 @@ def test_migrate_global_memory(requires_mongodb, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_auto_migrate_on_load_memory(tmp_path, requires_mongodb):
-    import server
+    import memory_map_mcp.server as server
     mem_file = tmp_path / MEMORY_FILE
     mem_file.write_text(json.dumps({"stack": "AutoMigratedValue", "_updated_stack": "2026-01-01T00:00:00Z"}), encoding="utf-8")
     server._auto_migrated_projects.clear()
@@ -199,7 +199,7 @@ def test_auto_migrate_on_load_memory(tmp_path, requires_mongodb):
 
 
 def test_auto_migrate_does_not_overwrite_existing(tmp_path, requires_mongodb):
-    import server
+    import memory_map_mcp.server as server
     save_memory(str(tmp_path), "stack", "MongoValue")
     mem_file = tmp_path / MEMORY_FILE
     mem_file.write_text(json.dumps({"stack": "FileValue"}), encoding="utf-8")
@@ -212,7 +212,7 @@ def test_auto_migrate_does_not_overwrite_existing(tmp_path, requires_mongodb):
 
 
 def test_auto_migrate_only_runs_once(tmp_path, requires_mongodb):
-    import server
+    import memory_map_mcp.server as server
     mem_file = tmp_path / MEMORY_FILE
     mem_file.write_text(json.dumps({"stack": "Value"}), encoding="utf-8")
     server._auto_migrated_projects.clear()
@@ -225,7 +225,7 @@ def test_auto_migrate_only_runs_once(tmp_path, requires_mongodb):
 
 
 def test_auto_migrate_skips_when_sentinel_exists(tmp_path, requires_mongodb):
-    import server
+    import memory_map_mcp.server as server
     col = _memory_collection()
     project = _normalize_project_path(str(tmp_path))
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

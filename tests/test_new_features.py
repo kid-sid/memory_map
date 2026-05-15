@@ -5,7 +5,7 @@ import pathlib
 
 import pytest
 
-from server import (
+from memory_map_mcp.server import (
     get_local_structure,
     list_projects,
     load_cross_project_memory,
