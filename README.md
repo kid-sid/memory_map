@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" width="160" alt="memory_map logo" />
+</p>
+
 # Memory Map — MCP Server for Claude Code
 
 [![CI](https://github.com/kid-sid/memory_map/actions/workflows/ci.yml/badge.svg)](https://github.com/kid-sid/memory_map/actions/workflows/ci.yml)
