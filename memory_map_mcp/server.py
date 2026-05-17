@@ -817,6 +817,27 @@ def get_history_chunks(project_path: str, ids: str) -> str:
 
 
 @mcp.tool()
+def delete_history(project_path: str, ids: str = "", older_than_days: int = 0) -> str:
+    """Delete history chunks by ID and/or age.
+
+    ids: comma-separated chunk IDs from load_history, e.g. "abc123,def456".
+    older_than_days: remove all chunks for this project older than N days (0 = disabled).
+
+    At least one of ids or older_than_days must be provided.
+    """
+    try:
+        id_list = [i.strip() for i in ids.split(",") if i.strip()] if ids else []
+        result = history_store.delete_chunks(
+            project_path, ids=id_list, older_than_days=older_than_days
+        )
+        return f"deleted: {result['deleted']} chunk(s)"
+    except ValueError as e:
+        return f"error: {e}"
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
 def backfill_history_embeddings(project_path: str = "", batch_size: int = 20) -> str:
     """Generate embeddings for chunks that don't have one yet.
 

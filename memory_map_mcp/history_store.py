@@ -393,6 +393,52 @@ def get_chunks(project: str, ids: list) -> tuple:
     return chunks, total_tokens
 
 
+def delete_chunks(project: str, ids: list = None, older_than_days: int = 0) -> dict:
+    """Delete history chunks by ID list and/or age.
+
+    ids: list of ObjectId strings, scoped to project.
+    older_than_days: delete chunks whose timestamp is older than N days (0 = skip).
+
+    At least one of ids (non-empty) or older_than_days > 0 must be provided.
+    Returns {"deleted": N}.
+    """
+    if not ids and older_than_days <= 0:
+        raise ValueError("provide ids, older_than_days > 0, or both")
+
+    col = _get_collection()
+    if col is None:
+        raise RuntimeError("MongoDB unavailable — MEMORY_MAP_MONGO_URI not set or unreachable")
+
+    conditions = []
+
+    if ids:
+        from bson import ObjectId
+        oids = []
+        for id_str in ids:
+            try:
+                oids.append(ObjectId(id_str))
+            except Exception:
+                pass
+        if oids:
+            conditions.append({"_id": {"$in": oids}})
+
+    if older_than_days > 0:
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=older_than_days)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+        conditions.append({"timestamp": {"$lt": cutoff_str}})
+
+    if not conditions:
+        return {"deleted": 0}
+
+    if len(conditions) == 1:
+        query = {"project": project, **conditions[0]}
+    else:
+        query = {"project": project, "$or": conditions}
+
+    result = col.delete_many(query)
+    return {"deleted": result.deleted_count}
+
+
 def get_latest_save(project: str) -> str:
     """Return ISO timestamp of the most recent chunk, or ''."""
     col = _get_collection()

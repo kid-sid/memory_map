@@ -527,3 +527,143 @@ def test_save_chunk_error_message_when_uri_set(monkeypatch):
 
     with pytest.raises(RuntimeError, match="temporarily unavailable"):
         history_store.save_chunk("/fake/project", "s1", "user: hi\nassistant: hello", [])
+
+
+# ---------------------------------------------------------------------------
+# delete_history / delete_chunks tests
+# ---------------------------------------------------------------------------
+
+def test_delete_chunks_by_id(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    id1 = history_store.save_chunk(project, "s", "user: alpha\nassistant: A", [])
+    id2 = history_store.save_chunk(project, "s", "user: beta\nassistant: B", [])
+    result = history_store.delete_chunks(project, ids=[id1])
+    assert result["deleted"] == 1
+    index = history_store.load_index(project, last_n=10)
+    remaining_ids = [e["id"] for e in index]
+    assert id1 not in remaining_ids
+    assert id2 in remaining_ids
+
+
+def test_delete_chunks_multiple_ids(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    id1 = history_store.save_chunk(project, "s", "user: one\nassistant: 1", [])
+    id2 = history_store.save_chunk(project, "s", "user: two\nassistant: 2", [])
+    id3 = history_store.save_chunk(project, "s", "user: three\nassistant: 3", [])
+    result = history_store.delete_chunks(project, ids=[id1, id2])
+    assert result["deleted"] == 2
+    index = history_store.load_index(project, last_n=10)
+    assert len(index) == 1
+    assert index[0]["id"] == id3
+
+
+def test_delete_chunks_unknown_id_is_noop(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    history_store.save_chunk(project, "s", "user: real\nassistant: yes", [])
+    result = history_store.delete_chunks(project, ids=["000000000000000000000000"])
+    assert result["deleted"] == 0
+    assert len(history_store.load_index(project, last_n=10)) == 1
+
+
+def test_delete_chunks_invalid_id_string_skipped(tmp_path, requires_mongodb):
+    project = str(tmp_path)
+    id1 = history_store.save_chunk(project, "s", "user: hello\nassistant: hi", [])
+    result = history_store.delete_chunks(project, ids=["not-an-objectid", id1])
+    assert result["deleted"] == 1
+
+
+def test_delete_chunks_scoped_to_project(tmp_path, requires_mongodb):
+    project_a = str(tmp_path / "proj_a")
+    project_b = str(tmp_path / "proj_b")
+    id_a = history_store.save_chunk(project_a, "s", "user: a\nassistant: a", [])
+    history_store.save_chunk(project_b, "s", "user: b\nassistant: b", [])
+    result = history_store.delete_chunks(project_a, ids=[id_a])
+    assert result["deleted"] == 1
+    assert len(history_store.load_index(project_b, last_n=10)) == 1
+
+
+def test_delete_chunks_older_than_days(tmp_path, requires_mongodb):
+    import datetime as dt
+    project = str(tmp_path)
+    col = history_store._get_collection()
+
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    old_id = history_store.save_chunk(project, "s", "user: old\nassistant: past", [])
+    new_id = history_store.save_chunk(project, "s", "user: new\nassistant: present", [])
+
+    from bson import ObjectId
+    col.update_one({"_id": ObjectId(old_id)}, {"$set": {"timestamp": old_ts}})
+    col.update_one({"_id": ObjectId(new_id)}, {"$set": {"timestamp": new_ts}})
+
+    result = history_store.delete_chunks(project, older_than_days=5)
+    assert result["deleted"] == 1
+    index = history_store.load_index(project, last_n=10)
+    assert len(index) == 1
+    assert index[0]["id"] == new_id
+
+
+def test_delete_chunks_no_args_raises(tmp_path):
+    with pytest.raises(ValueError, match="provide ids"):
+        history_store.delete_chunks(str(tmp_path), ids=[], older_than_days=0)
+
+
+def test_delete_chunks_both_filters(tmp_path, requires_mongodb):
+    import datetime as dt
+    project = str(tmp_path)
+    col = history_store._get_collection()
+
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    id_old = history_store.save_chunk(project, "s", "user: old\nassistant: past", [])
+    id_new = history_store.save_chunk(project, "s", "user: new\nassistant: present", [])
+    id_extra = history_store.save_chunk(project, "s", "user: extra\nassistant: also new", [])
+
+    from bson import ObjectId
+    col.update_one({"_id": ObjectId(id_old)}, {"$set": {"timestamp": old_ts}})
+    col.update_one({"_id": ObjectId(id_new)}, {"$set": {"timestamp": new_ts}})
+    col.update_one({"_id": ObjectId(id_extra)}, {"$set": {"timestamp": new_ts}})
+
+    # id_new matched by ID; id_old matched by age; id_extra untouched
+    result = history_store.delete_chunks(project, ids=[id_new], older_than_days=5)
+    assert result["deleted"] == 2
+    index = history_store.load_index(project, last_n=10)
+    assert len(index) == 1
+    assert index[0]["id"] == id_extra
+
+
+# MCP tool interface
+
+def test_mcp_delete_history_by_id(tmp_path, requires_mongodb):
+    from memory_map_mcp.server import delete_history
+    project = str(tmp_path)
+    id1 = history_store.save_chunk(project, "s", "user: to delete\nassistant: ok", [])
+    history_store.save_chunk(project, "s", "user: keep\nassistant: yes", [])
+    result = delete_history(project, ids=id1)
+    assert "deleted: 1" in result
+    assert len(history_store.load_index(project, last_n=10)) == 1
+
+
+def test_mcp_delete_history_older_than(tmp_path, requires_mongodb):
+    import datetime as dt
+    from memory_map_mcp.server import delete_history
+    project = str(tmp_path)
+    col = history_store._get_collection()
+
+    old_ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    id_old = history_store.save_chunk(project, "s", "user: stale\nassistant: old", [])
+    history_store.save_chunk(project, "s", "user: fresh\nassistant: new", [])
+
+    from bson import ObjectId
+    col.update_one({"_id": ObjectId(id_old)}, {"$set": {"timestamp": old_ts}})
+
+    result = delete_history(project, older_than_days=10)
+    assert "deleted: 1" in result
+
+
+def test_mcp_delete_history_no_args_returns_error(tmp_path):
+    from memory_map_mcp.server import delete_history
+    result = delete_history(str(tmp_path))
+    assert result.startswith("error:")
