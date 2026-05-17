@@ -1,7 +1,11 @@
 import pytest
 import json
 import datetime
-from memory_map_mcp.server import save_memory, load_memory, delete_memory, _load_json_safe, _read_memory, _write_memory
+from memory_map_mcp.server import (
+    save_memory, load_memory, delete_memory,
+    _load_json_safe, _read_memory, _write_memory,
+    _memory_collection, _normalize_project_path,
+)
 import pathlib
 
 
@@ -101,22 +105,36 @@ def test_delete_nonexistent_key(tmp_path):
     assert "not found" in result
 
 
-def test_save_memory_writes_timestamp(tmp_path, requires_file_mode):
+def test_save_memory_writes_timestamp(tmp_path):
     save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
-    data = _read_memory(str(tmp_path))
-    assert "_updated_stack" in data
-    ts = datetime.datetime.fromisoformat(data["_updated_stack"].replace("Z", "+00:00"))
+    col = _memory_collection()
+    if col is not None:
+        project = _normalize_project_path(str(tmp_path))
+        doc = col.find_one({"project": project, "key": "stack"})
+        assert doc is not None and "updated_at" in doc
+        ts = datetime.datetime.fromisoformat(doc["updated_at"].replace("Z", "+00:00"))
+    else:
+        data = _read_memory(str(tmp_path))
+        assert "_updated_stack" in data
+        ts = datetime.datetime.fromisoformat(data["_updated_stack"].replace("Z", "+00:00"))
     age = datetime.datetime.now(datetime.timezone.utc) - ts
     assert age.total_seconds() < 5
 
 
-def test_load_memory_stale_warning(tmp_path, requires_file_mode):
+def test_load_memory_stale_warning(tmp_path):
     save_memory(str(tmp_path), "stack", "FastAPI + MongoDB")
-    # Back-date the timestamp by 31 days to simulate a stale entry
-    data = _read_memory(str(tmp_path))
-    stale_ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    data["_updated_stack"] = stale_ts
-    _write_memory(str(tmp_path), data)
+    stale_ts = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=31)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Back-date the timestamp to 31 days ago in whichever storage is active.
+    col = _memory_collection()
+    if col is not None:
+        project = _normalize_project_path(str(tmp_path))
+        col.update_one({"project": project, "key": "stack"}, {"$set": {"updated_at": stale_ts}})
+    else:
+        data = _read_memory(str(tmp_path))
+        data["_updated_stack"] = stale_ts
+        _write_memory(str(tmp_path), data)
     result = load_memory(str(tmp_path))
     assert "stale" in result
     assert "31d old" in result

@@ -368,19 +368,29 @@ _memory_col_init_done = False
 
 def _memory_collection():
     global _memory_col, _memory_col_init_done
-    if _memory_col_init_done:
+
+    # Fast path: already connected.
+    if _memory_col is not None:
         return _memory_col
-    _memory_col_init_done = True
+
+    # URI was never set — permanent skip (env won't change without restart).
+    if _memory_col_init_done:
+        return None
+
     try:
         history_col = history_store._get_collection()
         if history_col is None:
+            # Distinguish "no URI" (permanent) from "transient failure" (retryable).
+            if not os.environ.get("MEMORY_MAP_MONGO_URI"):
+                _memory_col_init_done = True
+            # Transient failure: don't cache None — allow retry on next call.
             return None
         col = history_col.database["memory"]
         col.create_index([("project", 1), ("key", 1)], unique=True, background=True)
         col.create_index([("updated_at", -1)], background=True)
         _memory_col = col
     except Exception:
-        pass  # MongoDB unavailable — callers fall back to file
+        pass  # Transient error — don't cache None, allow retry on next call.
     return _memory_col
 
 

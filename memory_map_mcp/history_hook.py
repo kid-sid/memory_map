@@ -167,7 +167,7 @@ def extract_qa_pairs(transcript_path: str, watermark: int) -> tuple:
         role1, content1, _ = turns[i]
         role2, content2, line_end2 = turns[i + 1]
         if role1 == "user" and role2 == "assistant":
-            pairs.append({"user": content1, "assistant": content2})
+            pairs.append({"user": content1, "assistant": content2, "_wm": line_end2})
             new_watermark = line_end2
             i += 2
         else:
@@ -222,37 +222,58 @@ def main():
         print("{}")
         return
 
+    saved_watermark = watermark  # advances only as pairs are successfully persisted
     total_tokens = 0
     all_tags = set()
+    saved_pairs_count = 0
 
     for pair in pairs:
         dialogue = redact_secrets(f"user: {pair['user']}\nassistant: {pair['assistant']}")
         tags = history_store.extract_tags(dialogue)
-        all_tags.update(tags)
         chunks = split_into_chunks(dialogue)
         n = len(chunks)
         gid = uuid.uuid4().hex[:8] if n > 1 else None
 
-        for idx, chunk in enumerate(chunks, 1):
-            history_store.save_chunk(
-                cwd,
-                session_id[:8],
-                chunk,
-                tags,
-                group_id=gid,
-                part=(idx if n > 1 else None),
-                total_parts=(n if n > 1 else None),
-                embed=False,  # hooks must return quickly; embeddings backfilled separately
+        try:
+            for idx, chunk in enumerate(chunks, 1):
+                history_store.save_chunk(
+                    cwd,
+                    session_id[:8],
+                    chunk,
+                    tags,
+                    group_id=gid,
+                    part=(idx if n > 1 else None),
+                    total_parts=(n if n > 1 else None),
+                    embed=False,  # hooks must return quickly; embeddings backfilled separately
+                )
+                total_tokens += history_store.compute_stats(chunk)["tokens"]
+        except Exception as exc:
+            # MongoDB is temporarily unavailable.  Stop here so we don't leave
+            # orphaned group_id chunk chains.  The watermark stays at the last
+            # successfully committed pair, so the next invocation retries only
+            # the unsaved pairs — no duplicates for what was already persisted.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "memory_map hook: failed to save pair %d/%d: %s — will retry on next invocation",
+                saved_pairs_count + 1, len(pairs), exc,
             )
-            total_tokens += history_store.compute_stats(chunk)["tokens"]
+            break
 
-    write_watermark(session_id, new_watermark)
+        all_tags.update(tags)
+        saved_pairs_count += 1
+        saved_watermark = pair["_wm"]
+
+    if saved_watermark != watermark:
+        write_watermark(session_id, saved_watermark)
+
+    if saved_pairs_count == 0:
+        print("{}")
+        return
 
     tag_str = ",".join(sorted(all_tags)) if all_tags else "untagged"
-    n_pairs = len(pairs)
     output = {
         "systemMessage": (
-            f"[history] {n_pairs} pair(s) saved — tags:[{tag_str}] tokens:{total_tokens}"
+            f"[history] {saved_pairs_count} pair(s) saved — tags:[{tag_str}] tokens:{total_tokens}"
         )
     }
     print(json.dumps(output))

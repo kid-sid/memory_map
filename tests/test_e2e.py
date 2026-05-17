@@ -491,3 +491,108 @@ def test_hook_split_large_qa_pair(tmp_path):
         assert len(split_chunks) >= 2
         group_ids = {c["group_id"] for c in split_chunks}
         assert len(group_ids) == 1
+
+
+# ---------------------------------------------------------------------------
+# Hook crash-recovery: MongoDB failure must not crash the hook or lose progress
+# ---------------------------------------------------------------------------
+
+def test_hook_outputs_empty_json_when_mongodb_down(tmp_path):
+    """Hook exits 0 and outputs {} when MongoDB is unreachable — never crashes."""
+    transcript = make_transcript(tmp_path, [
+        {"role": "user",      "content": "fix the auth bug"},
+        {"role": "assistant", "content": "patched the JWT expiry check"},
+    ])
+    output = run_hook(
+        tmp_path, transcript,
+        env_overrides={"MEMORY_MAP_MONGO_URI": "mongodb://127.0.0.1:27999"},
+    )
+    # Hook must exit 0 (asserted inside run_hook) and produce either {} or a
+    # systemMessage.  With an unreachable MongoDB the save fails, so we expect {}.
+    assert output == {} or "systemMessage" not in output or output.get("systemMessage", "") == ""
+
+
+def test_hook_does_not_advance_watermark_on_total_failure(tmp_path):
+    """Watermark stays at 0 when all saves fail — pairs retry on next invocation."""
+    import tempfile
+
+    session_id = uuid.uuid4().hex
+
+    transcript = make_transcript(tmp_path, [
+        {"role": "user",      "content": "deploy the service"},
+        {"role": "assistant", "content": "deployed to production"},
+    ])
+
+    # Fire hook with bad MongoDB URI — save must fail.
+    run_hook(
+        tmp_path, transcript,
+        session_id=session_id,
+        env_overrides={"MEMORY_MAP_MONGO_URI": "mongodb://127.0.0.1:27999"},
+    )
+
+    # Watermark file should not exist (or remain at 0).
+    wm_path = pathlib.Path(tempfile.gettempdir()) / f"claude_hist_wm_{session_id[:8]}.txt"
+    if wm_path.exists():
+        assert wm_path.read_text().strip() == "0"
+
+
+def test_hook_partial_save_advances_watermark_to_last_success(tmp_path, monkeypatch, requires_mongodb):
+    """When pair N fails, watermark advances to after pair N-1 (no duplicates for saved pairs)."""
+    from memory_map_mcp.history_hook import extract_qa_pairs, split_into_chunks, write_watermark, read_watermark
+    import memory_map_mcp.history_store as hs
+
+    session_id = uuid.uuid4().hex
+
+    # Build a transcript with 3 pairs.
+    lines = [
+        {"role": "user",      "content": "task one"},
+        {"role": "assistant", "content": "done one"},
+        {"role": "user",      "content": "task two"},
+        {"role": "assistant", "content": "done two"},
+        {"role": "user",      "content": "task three"},
+        {"role": "assistant", "content": "done three"},
+    ]
+    transcript = make_transcript(tmp_path, lines)
+    pairs, _ = extract_qa_pairs(str(transcript), 0)
+    assert len(pairs) == 3
+
+    call_count = {"n": 0}
+    original_save = hs.save_chunk
+
+    def failing_save_chunk(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:  # fail on second pair onwards
+            raise RuntimeError("injected MongoDB failure")
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(hs, "save_chunk", failing_save_chunk)
+
+    # Import and run main() directly (not as subprocess) so monkeypatch applies.
+    import io
+    import sys as _sys
+    from memory_map_mcp import history_hook
+
+    payload = json.dumps({
+        "session_id": session_id,
+        "transcript_path": str(transcript),
+        "cwd": str(tmp_path),
+    })
+    monkeypatch.setattr(_sys, "stdin", io.StringIO(payload))
+    captured = io.StringIO()
+    monkeypatch.setattr(_sys, "stdout", captured)
+
+    history_hook.main()
+
+    output_str = captured.getvalue().strip()
+    output = json.loads(output_str or "{}")
+
+    # Only the first pair was saved.
+    assert "systemMessage" in output
+    assert "1 pair(s)" in output["systemMessage"]
+
+    # Watermark advanced to cover exactly the first pair.
+    import tempfile
+    wm_path = pathlib.Path(tempfile.gettempdir()) / f"claude_hist_wm_{session_id[:8]}.txt"
+    assert wm_path.exists(), "watermark file must be written when at least one pair saved"
+    saved_wm = int(wm_path.read_text().strip())
+    assert saved_wm == pairs[0]["_wm"], "watermark must stop at end of first (successful) pair"

@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import datetime
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -204,19 +205,35 @@ _TAG_KEYWORDS: dict = {
 KNOWN_TAGS = sorted(_TAG_KEYWORDS.keys())
 
 # Module-level MongoDB connection cache — initialised once per process.
+# _mongo_init_done is set True only when MEMORY_MAP_MONGO_URI is absent so
+# we never retry something that cannot change without a restart.  Transient
+# connection failures are retried after _MONGO_RETRY_INTERVAL seconds so a
+# MongoDB restart or network blip does not permanently break the server.
+_MONGO_RETRY_INTERVAL = 30  # seconds before retrying after a connection failure
 _mongo_col = None
-_mongo_init_done = False
+_mongo_init_done = False     # True only when URI is unset (permanent skip)
+_mongo_last_failure: float | None = None
 
 
 def _get_collection():
-    global _mongo_col, _mongo_init_done
-    if _mongo_init_done:
+    global _mongo_col, _mongo_init_done, _mongo_last_failure
+
+    # Fast path: already connected.
+    if _mongo_col is not None:
         return _mongo_col
-    _mongo_init_done = True
+
+    # URI was never set — no point retrying (env won't change without restart).
+    if _mongo_init_done:
+        return None
 
     uri = os.environ.get("MEMORY_MAP_MONGO_URI", "")
     if not uri:
+        _mongo_init_done = True
         logger.debug("memory_map: MEMORY_MAP_MONGO_URI not set — MongoDB history unavailable")
+        return None
+
+    # Respect retry cooldown after a previous failure.
+    if _mongo_last_failure is not None and time.monotonic() - _mongo_last_failure < _MONGO_RETRY_INTERVAL:
         return None
 
     try:
@@ -227,11 +244,15 @@ def _get_collection():
         col.create_index([("project", 1), ("timestamp", -1)], background=True)
         col.create_index([("project", 1), ("tags", 1)], background=True)
         _mongo_col = col
+        _mongo_last_failure = None
         logger.info("memory_map: connected to MongoDB at %s", uri)
     except Exception as exc:
-        raise RuntimeError(
-            f"memory_map: MongoDB unreachable at {uri!r}: {exc}"
-        ) from exc
+        _mongo_last_failure = time.monotonic()
+        logger.warning(
+            "memory_map: MongoDB unreachable at %r: %s — will retry in %ds",
+            uri, exc, _MONGO_RETRY_INTERVAL,
+        )
+        return None
 
     return _mongo_col
 
@@ -271,6 +292,11 @@ def save_chunk(project: str, session_id: str, dialogue: str, tags: list,
     """
     col = _get_collection()
     if col is None:
+        if os.environ.get("MEMORY_MAP_MONGO_URI"):
+            raise RuntimeError(
+                f"memory_map: MongoDB temporarily unavailable — history not saved "
+                f"(retrying in up to {_MONGO_RETRY_INTERVAL}s)"
+            )
         raise RuntimeError("memory_map: MEMORY_MAP_MONGO_URI is not set — cannot save history")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     stats = compute_stats(dialogue)

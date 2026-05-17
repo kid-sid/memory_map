@@ -446,3 +446,84 @@ def test_summarise_skips_existing_summaries(tmp_path, requires_mongodb):
     index = history_store.load_index(project, last_n=20)
     # summary from r1 + summary from r2 = 2 chunks
     assert len(index) == 2
+
+
+# ---------------------------------------------------------------------------
+# _get_collection reconnect / retry unit tests (no MongoDB required)
+# ---------------------------------------------------------------------------
+
+def test_get_collection_permanent_skip_when_no_uri(monkeypatch):
+    """When URI is absent, _get_collection sets _mongo_init_done and never retries."""
+    monkeypatch.setattr(history_store, "_mongo_col", None)
+    monkeypatch.setattr(history_store, "_mongo_init_done", False)
+    monkeypatch.setattr(history_store, "_mongo_last_failure", None)
+    monkeypatch.delenv("MEMORY_MAP_MONGO_URI", raising=False)
+
+    result = history_store._get_collection()
+    assert result is None
+    assert history_store._mongo_init_done, "should mark permanent skip when URI is unset"
+
+    result2 = history_store._get_collection()
+    assert result2 is None
+
+
+def test_get_collection_retries_after_cooldown(monkeypatch):
+    """After a transient failure, _get_collection retries once the cooldown expires."""
+    import time
+
+    monkeypatch.setattr(history_store, "_mongo_col", None)
+    monkeypatch.setattr(history_store, "_mongo_init_done", False)
+    monkeypatch.setattr(history_store, "_mongo_last_failure", None)
+    monkeypatch.setenv("MEMORY_MAP_MONGO_URI", "mongodb://127.0.0.1:27999")
+
+    # First call: connection fails, records failure time, returns None.
+    result = history_store._get_collection()
+    assert result is None
+    assert history_store._mongo_last_failure is not None
+    assert not history_store._mongo_init_done, "must NOT permanently skip on transient failure"
+
+    failure_time = history_store._mongo_last_failure
+
+    # Within cooldown: returns None without a new attempt.
+    result2 = history_store._get_collection()
+    assert result2 is None
+    assert history_store._mongo_last_failure == failure_time, "timestamp must not change during cooldown"
+
+    # Expire the cooldown artificially.
+    monkeypatch.setattr(
+        history_store, "_mongo_last_failure",
+        time.monotonic() - history_store._MONGO_RETRY_INTERVAL - 1,
+    )
+
+    # After cooldown: retries (still fails, but timestamp is refreshed).
+    result3 = history_store._get_collection()
+    assert result3 is None
+    assert history_store._mongo_last_failure > failure_time, "timestamp should update on retry"
+
+
+def test_get_collection_does_not_raise_on_transient_failure(monkeypatch):
+    """_get_collection must return None (not raise) when MongoDB is unreachable."""
+    monkeypatch.setattr(history_store, "_mongo_col", None)
+    monkeypatch.setattr(history_store, "_mongo_init_done", False)
+    monkeypatch.setattr(history_store, "_mongo_last_failure", None)
+    monkeypatch.setenv("MEMORY_MAP_MONGO_URI", "mongodb://127.0.0.1:27999")
+
+    try:
+        result = history_store._get_collection()
+    except Exception as exc:
+        pytest.fail(f"_get_collection raised unexpectedly: {exc}")
+    assert result is None
+
+
+def test_save_chunk_error_message_when_uri_set(monkeypatch):
+    """save_chunk error mentions 'temporarily unavailable' (not 'URI not set') when URI is configured."""
+    monkeypatch.setattr(history_store, "_mongo_col", None)
+    monkeypatch.setattr(history_store, "_mongo_init_done", False)
+    monkeypatch.setattr(history_store, "_mongo_last_failure", None)
+    monkeypatch.setenv("MEMORY_MAP_MONGO_URI", "mongodb://127.0.0.1:27999")
+
+    # First call exhausts the attempt and sets _mongo_last_failure (now in cooldown).
+    history_store._get_collection()
+
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        history_store.save_chunk("/fake/project", "s1", "user: hi\nassistant: hello", [])
