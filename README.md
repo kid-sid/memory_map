@@ -398,6 +398,25 @@ This means Claude can surface a relevant chunk from 3 months ago if it matches y
 | Key-value memory | MongoDB `memory_map.memory` | `MEMORY_MAP_MONGO_URI` is set (primary) |
 | Key-value memory | `.mcp_memory.json` per project | MongoDB not configured (fallback) |
 
+**Pruning history:**
+
+Use `delete_history` to remove chunks you no longer need — for example, to clean up stale context from a dead project or remove accidentally captured secrets:
+
+```
+# Delete specific chunks by ID (get IDs from load_history or suggest_history output)
+delete_history("C:/projects/my-api", ids="6830a1f2e4b0c1234567abcd,6830a1f2e4b0c1234567ef01")
+→ "deleted: 2 chunk(s)"
+
+# Remove everything older than 30 days
+delete_history("C:/projects/my-api", older_than_days=30)
+→ "deleted: 7 chunk(s)"
+
+# Both filters together — deletes chunks matching either condition
+delete_history("C:/projects/my-api", ids="6830a1f2e4b0c1234567abcd", older_than_days=30)
+```
+
+Deletion is scoped to the given project — other projects are never affected. At least one of `ids` or `older_than_days` must be provided.
+
 ---
 
 ## Memory compression
@@ -468,6 +487,7 @@ Useful when conversations get long, before switching topics, or before closing a
 | `summarise_history` | `project_path`, `n=10` | Collapse the n oldest non-summary chunks into one summary chunk. Triggered automatically by `save_history`; call manually to compact immediately |
 | `load_history` | `project_path`, `last_n=5` | Load the tag index for recent chunks (id, timestamp, tags, preview, token cost) — use for inspection or `/mem_save` flow |
 | `get_history_chunks` | `project_path`, `ids` | Fetch full dialogue for comma-separated chunk IDs + total token sum |
+| `delete_history` | `project_path`, `ids=""`, `older_than_days=0` | Delete chunks by comma-separated ID, by age (all chunks older than N days), or both together. At least one filter must be provided. Returns count deleted |
 | `backfill_history_embeddings` | `project_path=""`, `batch_size=20` | Generate embeddings for chunks saved before `MEMORY_MAP_EMBED_PROVIDER` was configured. Run repeatedly until `remaining=0` |
 | `backfill_bm25_text` | `project_path=""`, `batch_size=100` | Write the `bm25_text` field to chunks saved before this field was introduced. Run once after upgrading; repeat until `remaining=0` |
 
