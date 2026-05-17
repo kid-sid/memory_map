@@ -24,6 +24,8 @@ mcp = FastMCP("file-structure")
 
 # Persistent pool — avoids per-call thread creation overhead in suggest_history.
 _suggest_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="suggest")
+import atexit as _atexit
+_atexit.register(_suggest_executor.shutdown, wait=False)
 
 DEFAULT_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "dist", ".next", ".mypy_cache", ".pytest_cache"}
 
@@ -1016,6 +1018,21 @@ def _iter_project_dirs(root: pathlib.Path, max_depth: int, _current: int = 1):
         pass
 
 
+def _project_range_query(base_str: str) -> dict:
+    """Return a MongoDB filter matching project == base_str or any descendant.
+
+    Uses a half-open index range [base_str, base_str+sep+\\uffff) so MongoDB
+    performs a B-tree range scan on the (project, key) index rather than a
+    full COLLSCAN regex.  The separator suffix ensures sibling paths that share
+    the same prefix (e.g. /foo/bar vs /foo/barsuffix) are correctly excluded.
+    The __global__ sentinel is naturally outside every real filesystem path and
+    therefore never matched.
+    """
+    sep = os.sep
+    prefix = base_str if base_str.endswith(sep) else base_str + sep
+    return {"project": {"$gte": base_str, "$lt": prefix + "￿"}}
+
+
 def _within_depth(project: str, base_str: str, max_depth: int) -> bool:
     """Return True if the project path is within max_depth levels of base_str."""
     try:
@@ -1046,9 +1063,8 @@ def list_projects(base_path: str, max_depth: int = 1) -> str:
     col = _memory_collection()
     if col is not None:
         base_str = str(root)
-        prefix = re.escape(base_str)
         docs = list(col.find(
-            {"project": {"$regex": f"^{prefix}", "$ne": _GLOBAL_SENTINEL}},
+            _project_range_query(base_str),
             {"project": 1, "key": 1},
         ))
         by_project: dict = {}
@@ -1150,9 +1166,8 @@ def load_cross_project_memory(base_path: str, query_keys: str = "", max_depth: i
     col = _memory_collection()
     if col is not None:
         base_str = str(root)
-        prefix = re.escape(base_str)
         docs = list(col.find(
-            {"project": {"$regex": f"^{prefix}", "$ne": _GLOBAL_SENTINEL}},
+            _project_range_query(base_str),
         ))
         by_project: dict = {}
         for d in docs:
@@ -1219,9 +1234,8 @@ def search_across_projects(base_path: str, keyword: str, max_depth: int = 1) -> 
     col = _memory_collection()
     if col is not None:
         base_str = str(root)
-        prefix_pat = re.escape(base_str)
         docs = list(col.find(
-            {"project": {"$regex": f"^{prefix_pat}", "$ne": _GLOBAL_SENTINEL}},
+            _project_range_query(base_str),
             {"project": 1, "key": 1, "value": 1},
         ))
         for d in docs:

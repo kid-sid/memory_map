@@ -531,7 +531,7 @@ def test_hook_does_not_advance_watermark_on_total_failure(tmp_path):
     )
 
     # Watermark file should not exist (or remain at 0).
-    wm_path = pathlib.Path(tempfile.gettempdir()) / f"claude_hist_wm_{session_id[:8]}.txt"
+    wm_path = pathlib.Path.home() / ".claude" / "history_watermarks" / f"claude_hist_wm_{session_id}.txt"
     if wm_path.exists():
         assert wm_path.read_text().strip() == "0"
 
@@ -592,7 +592,7 @@ def test_hook_partial_save_advances_watermark_to_last_success(tmp_path, monkeypa
 
     # Watermark advanced to cover exactly the first pair.
     import tempfile
-    wm_path = pathlib.Path(tempfile.gettempdir()) / f"claude_hist_wm_{session_id[:8]}.txt"
+    wm_path = pathlib.Path.home() / ".claude" / "history_watermarks" / f"claude_hist_wm_{session_id}.txt"
     assert wm_path.exists(), "watermark file must be written when at least one pair saved"
     saved_wm = int(wm_path.read_text().strip())
     assert saved_wm == pairs[0]["_wm"], "watermark must stop at end of first (successful) pair"

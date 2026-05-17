@@ -29,15 +29,20 @@ from memory_map_mcp.redact import redact_secrets
 MAX_TURN_CHARS   = int(os.environ.get("MCP_MAX_TURN_CHARS",  "3000"))
 MAX_CHUNK_CHARS  = int(os.environ.get("MCP_MAX_CHUNK_CHARS", "4000"))
 OVERLAP_CHARS    = int(os.environ.get("MCP_OVERLAP_CHARS",   "100"))
-TEMP_FILE_TTL_DAYS = 7
+WM_TTL_DAYS = 7
+
+# Watermarks live in ~/.claude/history_watermarks/ — stable across OS temp
+# cleanups and third-party disk cleaners that wipe %TEMP%/tmp.
+_WM_DIR = pathlib.Path.home() / ".claude" / "history_watermarks"
 
 
-# --- Temp file cleanup ---
+# --- Watermark cleanup ---
 
-def _cleanup_stale_temp_files():
-    tmp_dir = pathlib.Path(tempfile.gettempdir())
-    cutoff = datetime.now().timestamp() - TEMP_FILE_TTL_DAYS * 86400
-    for f in tmp_dir.glob("claude_hist_wm_*.txt"):
+def _cleanup_stale_watermarks():
+    if not _WM_DIR.exists():
+        return
+    cutoff = datetime.now().timestamp() - WM_TTL_DAYS * 86400
+    for f in _WM_DIR.glob("claude_hist_wm_*.txt"):
         try:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
@@ -45,10 +50,12 @@ def _cleanup_stale_temp_files():
             pass
 
 
-# --- Watermark (stored in OS temp dir) ---
+# --- Watermark ---
 
 def _watermark_path(session_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"claude_hist_wm_{session_id[:8]}.txt"
+    # Full session_id avoids the 2^32 collision space of the old [:8] truncation.
+    _WM_DIR.mkdir(parents=True, exist_ok=True)
+    return _WM_DIR / f"claude_hist_wm_{session_id}.txt"
 
 
 def read_watermark(session_id: str) -> int:
@@ -193,7 +200,7 @@ def split_into_chunks(text: str) -> list:
 # --- Main ---
 
 def main():
-    _cleanup_stale_temp_files()
+    _cleanup_stale_watermarks()
 
     force = "--force" in sys.argv
 

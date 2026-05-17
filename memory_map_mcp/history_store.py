@@ -795,10 +795,26 @@ def summarise_oldest_chunks(project: str, n: int = 10) -> dict:
 
     Concatenates their dialogues chronologically, saves as a new chunk with
     type='summary', then deletes the source chunks. Returns stats dict.
+
+    Crash-safety: source ObjectIds are stored on the summary document as
+    source_ids before the delete so that a crash between save and delete is
+    detectable.  On the next call the orphaned delete is completed first.
     """
+    from bson import ObjectId
+
     col = _get_collection()
     if col is None:
         return {"error": "MongoDB not configured"}
+
+    # Complete any interrupted summarise from a previous crashed run.
+    # An in-progress summary carries source_ids; finish the delete and clear it.
+    orphan = col.find_one(
+        {"project": project, "type": "summary", "source_ids": {"$exists": True}},
+        {"_id": 1, "source_ids": 1},
+    )
+    if orphan is not None:
+        col.delete_many({"_id": {"$in": orphan["source_ids"]}})
+        col.update_one({"_id": orphan["_id"]}, {"$unset": {"source_ids": ""}})
 
     cursor = col.find(
         {"project": project, "type": {"$ne": "summary"}},
@@ -813,15 +829,22 @@ def summarise_oldest_chunks(project: str, n: int = 10) -> dict:
     start_ts = chunks[0].get("timestamp", "")
     end_ts = chunks[-1].get("timestamp", "")
     all_tags = sorted({tag for c in chunks for tag in c.get("tags", [])})
+    source_ids = [c["_id"] for c in chunks]
 
     combined = "\n\n---\n\n".join(c.get("dialogue", "") for c in chunks)
     summary_text = f"[Summary of {len(chunks)} chunks from {start_ts} to {end_ts}]\n\n{combined}"
 
     chunk_id = save_chunk(project, "auto-summary", summary_text, all_tags, embed=False)
 
-    from bson import ObjectId
-    col.update_one({"_id": ObjectId(chunk_id)}, {"$set": {"type": "summary"}})
-    col.delete_many({"_id": {"$in": [c["_id"] for c in chunks]}})
+    # Mark as summary and record source_ids atomically before deleting sources.
+    # If the process dies after this update but before delete_many, the next
+    # call will find source_ids on this doc and complete the deletion.
+    col.update_one(
+        {"_id": ObjectId(chunk_id)},
+        {"$set": {"type": "summary", "source_ids": source_ids}},
+    )
+    col.delete_many({"_id": {"$in": source_ids}})
+    col.update_one({"_id": ObjectId(chunk_id)}, {"$unset": {"source_ids": ""}})
 
     return {
         "summarised": len(chunks),
