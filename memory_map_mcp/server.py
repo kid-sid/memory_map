@@ -10,6 +10,7 @@ import datetime
 import concurrent.futures
 import tempfile
 import logging
+import traceback
 import warnings
 
 import pathspec
@@ -755,7 +756,7 @@ def save_history(project_path: str, summary: str, session_id: str = "", tags: st
 
         return result
     except Exception as e:
-        return f"error: {e}"
+        return f"error: {e}\n{traceback.format_exc()}"
 
 
 @mcp.tool()
