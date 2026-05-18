@@ -17,7 +17,16 @@ logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
+# Initial load so module-level env reads below see values from .env.  Note that
+# _get_collection() re-runs load_dotenv(override=True) on every connection attempt
+# so a .env created or edited after the MCP server starts is still picked up — see #83.
 load_dotenv()
+
+if not os.environ.get("MEMORY_MAP_MONGO_URI"):
+    logger.warning(
+        "memory_map: MEMORY_MAP_MONGO_URI not set at startup — history features "
+        "will be unavailable until .env is created/updated (re-checked on each call)"
+    )
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIMS = 1536
@@ -204,36 +213,36 @@ _TAG_KEYWORDS: dict = {
 
 KNOWN_TAGS = sorted(_TAG_KEYWORDS.keys())
 
-# Module-level MongoDB connection cache — initialised once per process.
-# _mongo_init_done is set True only when MEMORY_MAP_MONGO_URI is absent so
-# we never retry something that cannot change without a restart.  Transient
-# connection failures are retried after _MONGO_RETRY_INTERVAL seconds so a
-# MongoDB restart or network blip does not permanently break the server.
-_MONGO_RETRY_INTERVAL = 30  # seconds before retrying after a connection failure
+# Module-level MongoDB connection cache — initialised on first use per process.
+# Both "URI not set" and "connection failed" fall under the same cooldown so
+# that a .env created after the MCP server starts (see #83) is picked up on
+# the next attempt after _MONGO_RETRY_INTERVAL, not only on full server restart.
+_MONGO_RETRY_INTERVAL = 30  # seconds before retrying after a missing URI or connection failure
 _mongo_col = None
-_mongo_init_done = False     # True only when URI is unset (permanent skip)
 _mongo_last_failure: float | None = None
 
 
 def _get_collection():
-    global _mongo_col, _mongo_init_done, _mongo_last_failure
+    global _mongo_col, _mongo_last_failure
 
     # Fast path: already connected.
     if _mongo_col is not None:
         return _mongo_col
 
-    # URI was never set — no point retrying (env won't change without restart).
-    if _mongo_init_done:
+    # Respect retry cooldown after a previous failure (or previously missing URI).
+    if _mongo_last_failure is not None and time.monotonic() - _mongo_last_failure < _MONGO_RETRY_INTERVAL:
         return None
+
+    # Re-read .env so a URI added after server start is picked up (#83).
+    # Default override=False keeps explicit env vars (shell / MCP config) winning
+    # over .env — only newly-introduced keys are surfaced.  Editing an existing
+    # value in .env still requires a restart.
+    load_dotenv()
 
     uri = os.environ.get("MEMORY_MAP_MONGO_URI", "")
     if not uri:
-        _mongo_init_done = True
-        logger.debug("memory_map: MEMORY_MAP_MONGO_URI not set — MongoDB history unavailable")
-        return None
-
-    # Respect retry cooldown after a previous failure.
-    if _mongo_last_failure is not None and time.monotonic() - _mongo_last_failure < _MONGO_RETRY_INTERVAL:
+        _mongo_last_failure = time.monotonic()
+        logger.debug("memory_map: MEMORY_MAP_MONGO_URI not set — will recheck in %ds", _MONGO_RETRY_INTERVAL)
         return None
 
     try:

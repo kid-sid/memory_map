@@ -1,6 +1,7 @@
 """Tests for the redesigned history system (tag index + full-fetch pattern)."""
 
 import datetime
+import os
 import pytest
 from memory_map_mcp import history_store
 from memory_map_mcp.server import save_history, load_history, get_history_chunks
@@ -452,19 +453,59 @@ def test_summarise_skips_existing_summaries(tmp_path, requires_mongodb):
 # _get_collection reconnect / retry unit tests (no MongoDB required)
 # ---------------------------------------------------------------------------
 
-def test_get_collection_permanent_skip_when_no_uri(monkeypatch):
-    """When URI is absent, _get_collection sets _mongo_init_done and never retries."""
+def test_get_collection_returns_none_and_arms_cooldown_when_no_uri(monkeypatch):
+    """When URI is absent, _get_collection returns None and arms the retry cooldown.
+
+    The cooldown lets a .env created after server start be picked up on the
+    next attempt (see #83) instead of being permanently skipped.
+    """
     monkeypatch.setattr(history_store, "_mongo_col", None)
-    monkeypatch.setattr(history_store, "_mongo_init_done", False)
     monkeypatch.setattr(history_store, "_mongo_last_failure", None)
     monkeypatch.delenv("MEMORY_MAP_MONGO_URI", raising=False)
+    # Stop load_dotenv from re-populating the env from a real .env in the repo root.
+    monkeypatch.setattr(history_store, "load_dotenv", lambda *a, **kw: False)
 
     result = history_store._get_collection()
     assert result is None
-    assert history_store._mongo_init_done, "should mark permanent skip when URI is unset"
+    assert history_store._mongo_last_failure is not None, "cooldown must be armed so future calls back off"
 
+    # Within cooldown: returns None without re-checking the env.
     result2 = history_store._get_collection()
     assert result2 is None
+
+
+def test_get_collection_picks_up_uri_added_after_startup(monkeypatch, tmp_path):
+    """A .env created after the server started must be picked up on the next attempt (#83)."""
+    import time
+
+    monkeypatch.setattr(history_store, "_mongo_col", None)
+    monkeypatch.setattr(history_store, "_mongo_last_failure", None)
+    monkeypatch.delenv("MEMORY_MAP_MONGO_URI", raising=False)
+
+    # Simulate "no .env yet at server start" — the lazy reload must not see a URI.
+    monkeypatch.setattr(history_store, "load_dotenv", lambda *a, **kw: False)
+    first = history_store._get_collection()
+    assert first is None
+    assert history_store._mongo_last_failure is not None
+
+    # Expire the cooldown to simulate enough time passing.
+    monkeypatch.setattr(
+        history_store, "_mongo_last_failure",
+        time.monotonic() - history_store._MONGO_RETRY_INTERVAL - 1,
+    )
+
+    # Simulate the user creating .env mid-session: the next lazy reload pulls in a URI.
+    def fake_load_dotenv(*args, **kwargs):
+        import os
+        os.environ["MEMORY_MAP_MONGO_URI"] = "mongodb://127.0.0.1:27999"
+        return True
+    monkeypatch.setattr(history_store, "load_dotenv", fake_load_dotenv)
+
+    # Second attempt: env reload surfaces the new URI; connection attempt fails
+    # (no mongo on :27999) but the key point is we _did_ try, proving the URI was read.
+    result = history_store._get_collection()
+    assert result is None
+    assert os.environ.get("MEMORY_MAP_MONGO_URI") == "mongodb://127.0.0.1:27999"
 
 
 def test_get_collection_retries_after_cooldown(monkeypatch):
@@ -472,7 +513,6 @@ def test_get_collection_retries_after_cooldown(monkeypatch):
     import time
 
     monkeypatch.setattr(history_store, "_mongo_col", None)
-    monkeypatch.setattr(history_store, "_mongo_init_done", False)
     monkeypatch.setattr(history_store, "_mongo_last_failure", None)
     monkeypatch.setenv("MEMORY_MAP_MONGO_URI", "mongodb://127.0.0.1:27999")
 
@@ -480,7 +520,6 @@ def test_get_collection_retries_after_cooldown(monkeypatch):
     result = history_store._get_collection()
     assert result is None
     assert history_store._mongo_last_failure is not None
-    assert not history_store._mongo_init_done, "must NOT permanently skip on transient failure"
 
     failure_time = history_store._mongo_last_failure
 
@@ -504,7 +543,6 @@ def test_get_collection_retries_after_cooldown(monkeypatch):
 def test_get_collection_does_not_raise_on_transient_failure(monkeypatch):
     """_get_collection must return None (not raise) when MongoDB is unreachable."""
     monkeypatch.setattr(history_store, "_mongo_col", None)
-    monkeypatch.setattr(history_store, "_mongo_init_done", False)
     monkeypatch.setattr(history_store, "_mongo_last_failure", None)
     monkeypatch.setenv("MEMORY_MAP_MONGO_URI", "mongodb://127.0.0.1:27999")
 
@@ -518,7 +556,6 @@ def test_get_collection_does_not_raise_on_transient_failure(monkeypatch):
 def test_save_chunk_error_message_when_uri_set(monkeypatch):
     """save_chunk error mentions 'temporarily unavailable' (not 'URI not set') when URI is configured."""
     monkeypatch.setattr(history_store, "_mongo_col", None)
-    monkeypatch.setattr(history_store, "_mongo_init_done", False)
     monkeypatch.setattr(history_store, "_mongo_last_failure", None)
     monkeypatch.setenv("MEMORY_MAP_MONGO_URI", "mongodb://127.0.0.1:27999")
 
